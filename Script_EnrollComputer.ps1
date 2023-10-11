@@ -1,4 +1,4 @@
-﻿#region Powershell script transcript
+﻿# region Powershell script transcript
 $Date = Get-Date -Format "dddd MM-dd-yyyy HHmm"
 $TranscriptPath = "C:\Windows\Temp\EnrollmentScript - $Date.log"
 Try{Start-Transcript -Path $TranscriptPath -Force -ErrorAction Stop}catch{Start-Transcript -Path $TranscriptPath -Force}
