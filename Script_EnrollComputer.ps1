@@ -121,20 +121,6 @@ Would you like to install the updates? Valid options are 'Yes' or 'No'"
 
 #Region - Functions
 Function Enroll-Device(){
-    #region - Internet Status
-    $InternetConnection = Test-Connection -ComputerName google.com -Count 1 -quiet
-
-    if ($InternetConnection -eq 'true'){
-        Write-Host "
-    Congrats, you've reached level 1 teHc status. We have the internet!
-        " -foregroundcolor green
-    }else{
-        Write-Host "
-    Look, I can't do everything for you. Stop being such a noob and get some internet going. I'm leaving you now. Try again when you learn how to computer" -foregroundcolor red
-        exit
-    }
-    #endregion - Internet Status
-
     Write-Host "Script has been initiated. USB no longer needs to be plugged in to this device. Feel free to unplug it and move on to the next PC" -foregroundcolor Yellow
 
     Write-Host "
