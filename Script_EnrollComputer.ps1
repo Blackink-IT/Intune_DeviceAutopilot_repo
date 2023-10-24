@@ -199,43 +199,45 @@ Function Enroll-Device(){
         #Get DisplayName info
         $QueryDisplayName = $QueryUser.DisplayName
         Write-Host "User Confirmed. Looks like $QueryDisplayName is getting a new computer." -ForegroundColor green
-    }else{
-            while(($Spare -eq "") -or ($null -eq $Spare) -or ("yes","no" -notcontains $Spare)){
-            $Spare = Read-host 'Is this PC going to be used as a spare?'}
-                if($Spare -eq 'No'){
-                    while(($GroupAssignment -eq "") -or ($null -eq $GroupAssignment)){
-                    $GroupAssignment = Read-host '
+        #Set needed group for query
+        $GroupAssignment = "Intune_Devices_AutopilotDeployed"
+    }# else{
+    #         while(($Spare -eq "") -or ($null -eq $Spare) -or ("yes","no" -notcontains $Spare)){
+    #         $Spare = Read-host 'Is this PC going to be used as a spare?'}
+    #             if($Spare -eq 'No'){
+    #                 while(($GroupAssignment -eq "") -or ($null -eq $GroupAssignment)){
+    #                 $GroupAssignment = Read-host '
 
-    You have selected to deploy this PC to a non standard group
-    What is the group name in Azure AD that this PC should be assigned to?'}
-                while(($AssignUser -eq "") -or ($null -eq $AssignUser) -or ("yes","no" -notcontains $AssignUser)){
-                    $AssignUser = Read-Host 'Do you still need to assign a user?'}
-                if($AssignUser -eq 'yes'){
-                    while(($UPN -eq "") -or ($null -eq $UPN)){
-                    $UPN = Read-Host '
-    What is the users Email/Username (userPrincipalName)'}
-                    #Make sure a full email was entered
-                    While ($UPN -notlike '*@*'){
-                        Write-Host "
-    It does NOT look like you entered a valid email address. Please make sure you enter their full email addrss including the @ symbol and domain" -foregroundcolor red
-                        $UPN = Read-Host 'What is the users Email/Username (userPrincipalName)'
-                        }
-                        #Connect to Graph and Azure to test username
-                    $QueryUser = Get-AzureADUser -Filter "userPrincipalName eq '$UPN'"
-                    $UPNId = $QueryUser.ObjectId
-                    While ($null -eq $UPNId){
-                        Write-Host "It does look like the username you entered ($UPN) was not correct. We could not find a matching user in Azure AD. Please retry" -ForegroundColor Red
-                        while(($UPN -eq "") -or ($null -eq $UPN)){
-                            $UPN = Read-Host 'We could not find the user in Azure. What is the users Email/Username (userPrincipalName)'}
-                        $QueryUser = Get-AzureADUser -Filter "userPrincipalName eq '$UPN'"
-                        $UPNId = $QueryUser.ObjectId
-                        #Get DisplayName info
-                        $QueryDisplayName = $QueryUser.DisplayName
-                        Write-Host "User Confirmed. Looks like $QueryDisplayName is getting a new computer." -ForegroundColor green
-                        }
-                }
-        }
-    }
+    # You have selected to deploy this PC to a non standard group
+    # What is the group name in Azure AD that this PC should be assigned to?'}
+    #             while(($AssignUser -eq "") -or ($null -eq $AssignUser) -or ("yes","no" -notcontains $AssignUser)){
+    #                 $AssignUser = Read-Host 'Do you still need to assign a user?'}
+    #             if($AssignUser -eq 'yes'){
+    #                 while(($UPN -eq "") -or ($null -eq $UPN)){
+    #                 $UPN = Read-Host '
+    # What is the users Email/Username (userPrincipalName)'}
+    #                 #Make sure a full email was entered
+    #                 While ($UPN -notlike '*@*'){
+    #                     Write-Host "
+    # It does NOT look like you entered a valid email address. Please make sure you enter their full email addrss including the @ symbol and domain" -foregroundcolor red
+    #                     $UPN = Read-Host 'What is the users Email/Username (userPrincipalName)'
+    #                     }
+    #                     #Connect to Graph and Azure to test username
+    #                 $QueryUser = Get-AzureADUser -Filter "userPrincipalName eq '$UPN'"
+    #                 $UPNId = $QueryUser.ObjectId
+    #                 While ($null -eq $UPNId){
+    #                     Write-Host "It does look like the username you entered ($UPN) was not correct. We could not find a matching user in Azure AD. Please retry" -ForegroundColor Red
+    #                     while(($UPN -eq "") -or ($null -eq $UPN)){
+    #                         $UPN = Read-Host 'We could not find the user in Azure. What is the users Email/Username (userPrincipalName)'}
+    #                     $QueryUser = Get-AzureADUser -Filter "userPrincipalName eq '$UPN'"
+    #                     $UPNId = $QueryUser.ObjectId
+    #                     #Get DisplayName info
+    #                     $QueryDisplayName = $QueryUser.DisplayName
+    #                     Write-Host "User Confirmed. Looks like $QueryDisplayName is getting a new computer." -ForegroundColor green
+    #                     }
+    #             }
+    #     }
+    # }
 
 
     #Get desired computer name
@@ -279,11 +281,7 @@ Function Enroll-Device(){
     }
 
     #Azure group name and Autopilot GroupTag
-    if(($GroupAssignment -eq "") -or ($null -eq $GroupAssignment)){
-        $GroupName = "Intune_Devices_AutopilotDeployed"
-    }else {
-        $GroupName = $GroupAssignment
-    }
+    $GroupName = $GroupAssignment
     #endregion
 
     #Check for valid group
