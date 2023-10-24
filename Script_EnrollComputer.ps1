@@ -295,6 +295,13 @@ Function Enroll-Device(){
             $QueryGroup = Get-AzureADGroup | Where-Object{$_.displayName -like "*$GroupName*"}
         }
 
+    #To save time start checking for windows updates
+    $SilentWindowsUpdateBlock = {Import-Module -Name PSWindowsUpdate -Force
+    Get-WindowsUpdate -AcceptAll -Install -IgnoreReboot -silent}
+    Write-Host "
+    While things are running windows updates will be installed silently in the background" -foregroundcolor Magenta
+    $JobStart = Start-Job -ScriptBlock $SilentWindowsUpdateBlock
+
     #Kick off device upload process
     if(($null -eq $UPN) -or ($UPN -eq "")){
         Get-WindowsAutoPilotInfo -Online -AddToGroup $GroupName -Assign -AssignedComputerName $ComputerName
@@ -380,7 +387,10 @@ Function Enroll-Device(){
     ========================================================================
     Checking for updates. If there are any available they will be installed.
     If a reboot is needed for an update it will be initiated." -ForegroundColor Magenta
-
+    Write-Host "
+Updates will now be installed if there are some remaining.
+    If you are in a rush and need updates to not install simply hit Ctrl + c to end the script."
+    $StopJob = Get-Job | Stop-Job
     UpdateWindows -InstallUpdates "Yes"
     Stop-Transcript
 }
