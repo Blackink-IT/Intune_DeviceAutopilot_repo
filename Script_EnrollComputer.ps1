@@ -100,6 +100,11 @@ Function Check-PowerShellModule(){
 
 #Region - function to update windows
 Function UpdateWindows(){
+    param(
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$InstallUpdates
+    )
     Check-PowerShellModule -ModuleName PSWindowsUpdate
     $Updates = Get-WindowsUpdate
     if($Updates){
@@ -373,20 +378,14 @@ Function Enroll-Device(){
     NOTE: Microsoft changed how this behaves. Assigning the user no longer shows it as an 'Assigned User' during White Glove nor does it show the users name once the user logs in. This information is still grabbed for per user LoB MSI app and LoB store apps though.
 
     Group Tag: $groupTag
-    NOTE: Not typically needed" -ForegroundColor Magenta
-    while(!($Reboot) -or ($Reboot -eq "") -or ("Yes", "No" -notcontains $Reboot)){
-        Write-Host "====================================
-Entering 'No' below restarts the computer so it enters the standard AutoPilot deployment.
-Entering 'Yes' will simply end this portion of the script so YOU can hit the windows key x5 and enter the White Glove deployment screen" -foregroundcolor yellow
-        $Reboot = Read-host "Would you like to perform a AutoPilot White Glove deployment? Please enter 'Yes' or 'No'"
-    }
-    if($Reboot -eq "No"){
-        Write-Host "Restarting now"
-        Stop-Transcript
-        Shutdown /r /t 0
-    }else{
-        break
-    }
+    NOTE: Not typically needed
+    
+    ========================================================================
+    Checking for updates. If there are any available they will be installed.
+    If a reboot is needed for an update it will be initiated." -ForegroundColor Magenta
+
+    UpdateWindows -InstallUpdates "Yes"
+    Stop-Transcript
 }
 #Autopilot Nuke pulled from here: https://www.powershellgallery.com/packages/AutopilotNuke/2.3/Content/AutopilotNuke.ps1
 Function AutopilotNuke(){
