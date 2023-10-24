@@ -157,9 +157,6 @@ Function Enroll-Device(){
     #     }
     #endregion - Install Modules and scripts
 
-    #Update windows
-    UpdateWindows
-
     #Region Get and assign variables
     Write-Host("
 
