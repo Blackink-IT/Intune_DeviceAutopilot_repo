@@ -394,36 +394,36 @@ Updates will now be installed if there are some remaining.
     UpdateWindows -InstallUpdates "Yes"
     Stop-Transcript
 }
-#Autopilot Nuke pulled from here: https://www.powershellgallery.com/packages/AutopilotNuke/2.3/Content/AutopilotNuke.ps1
-Function AutopilotNuke(){
 
+#Autopilot Nuke pulled from here: https://www.powershellgallery.com/packages/AutopilotNuke/3.6/Content/autopilotnuke.ps1
+Function AutopilotNuke(){
     <#PSScriptInfo
-    
-    .VERSION 2.3
-    
+    .VERSION 3.6
     .GUID b608a45b-6cd0-405e-bfb2-aa11450821b5
-    
-    .AUTHOR Alexey Semibratov
-    
+    .AUTHOR Alexey Semibratov - Updated by Andrew Taylor
     .COMPANYNAME
-    
     .COPYRIGHT Alexey Semibratov
-    
     .TAGS
-    
-    .LICENSEURI
-    
+    .LICENSEURI https://github.com/andrew-s-taylor/WindowsAutopilotInfo/blob/main/LICENSE
     .PROJECTURI
-    
     .ICONURI
-    
     .EXTERNALMODULEDEPENDENCIES
-    
     .REQUIREDSCRIPTS
-    
     .EXTERNALSCRIPTDEPENDENCIES
-    
     .RELEASENOTES
+    Version 3.6: Added None option for assigned user
+    Version 3.5: Function update
+    Version 3.4: Fix in function name
+    Version 3.3: Changed method to grab devices
+    Version 3.2: Second fix
+    Version 3.1: Fix
+    Version 3.0: Updated to work with SDK v2
+    Version 2.9: Remove-MgDevice ObjectID switched to ID to match updated module
+    Version 2.8: Fixed speechmarks issue
+    Version 2.7: Changed Autopilot delete method
+    Version 2.6: Fixed mg-device command
+    Version 2.5: Typo
+    Version 2.4: Switched to MgGraph SDK and added support for app reg
     Version 2.1: Bugfix
     Version 2.0: Bugfix
     Version 1.9: Bugfix
@@ -434,7 +434,6 @@ Function AutopilotNuke(){
     Version 1.2: Added more documentation and set of required rights. Now if the device is not found in Autopilot, but exists in Intune (by serial number), it still cleans it from AD DS and AAD
     Version 1.1: Invoke-AutopilotSync, when called too soon, error out
     Version 1.0: Original public version.
-    
     #>
 
     <#
@@ -458,7 +457,7 @@ Function AutopilotNuke(){
     Asks for deletion of each object
     Usage:
     - The script can work from running Windows 10, but be careful removing native Azure AD joined Intune Devices - you can lock yourself out, if you do not know local administrator's password
-    - Intended usage – from OOBE (Out of Box Experience)
+    - Intended usage - from OOBE (Out of Box Experience)
     - While in OOBE, hits Shift+F10
     - Powershell.exe
     - Install-Script AutopilotNuke
@@ -478,14 +477,7 @@ Function AutopilotNuke(){
             Ask if you want to add it to AP then adds
     
     Minimum security rights needed:
-    • To authorize Intune Graph, you will need global admin, but this is just one time. Ask your GA to run:
-        Install-PackageProvider -Name NuGet
-        Install-Module AzureAD
-        Install-Module WindowsAutopilotIntune
-        Install-Module Microsoft.Graph.Intune
-        Connect-AzureAD
-        Connect-MSGraph
-        Accept the consent prompt
+    • This script will install the required modules
     • Custom role with the following permissions required in Intune:
         Managed devices
             Read
@@ -504,58 +496,181 @@ Function AutopilotNuke(){
     #> 
     [CmdletBinding()]
     param(
+        [Parameter(Mandatory = $False)] [String] $TenantId = "",
+        [Parameter(Mandatory = $False)] [String] $AppId = "",
+        [Parameter(Mandatory = $False)] [String] $AppSecret = ""
     )
+
+
+    Function Connect-ToGraph {
+        <#
+    .SYNOPSIS
+    Authenticates to the Graph API via the Microsoft.Graph.Authentication module.
+    
+    .DESCRIPTION
+    The Connect-ToGraph cmdlet is a wrapper cmdlet that helps authenticate to the Intune Graph API using the Microsoft.Graph.Authentication module. It leverages an Azure AD app ID and app secret for authentication or user-based auth.
+    
+    .PARAMETER Tenant
+    Specifies the tenant (e.g. contoso.onmicrosoft.com) to which to authenticate.
+    
+    .PARAMETER AppId
+    Specifies the Azure AD app ID (GUID) for the application that will be used to authenticate.
+    
+    .PARAMETER AppSecret
+    Specifies the Azure AD app secret corresponding to the app ID that will be used to authenticate.
+    
+    .PARAMETER Scopes
+    Specifies the user scopes for interactive authentication.
+    
+    .EXAMPLE
+    Connect-ToGraph -TenantId $tenantID -AppId $app -AppSecret $secret
+    
+    -#>
+        [cmdletbinding()]
+        param
+        (
+            [Parameter(Mandatory = $false)] [string]$Tenant,
+            [Parameter(Mandatory = $false)] [string]$AppId,
+            [Parameter(Mandatory = $false)] [string]$AppSecret,
+            [Parameter(Mandatory = $false)] [string]$scopes
+        )
+
+        Process {
+            Import-Module Microsoft.Graph.Authentication
+            $version = (get-module microsoft.graph.authentication | Select-Object -expandproperty Version).major
+
+            if ($AppId -ne "") {
+                $body = @{
+                    grant_type    = "client_credentials";
+                    client_id     = $AppId;
+                    client_secret = $AppSecret;
+                    scope         = "https://graph.microsoft.com/.default";
+                }
+        
+                $response = Invoke-RestMethod -Method Post -Uri https://login.microsoftonline.com/$Tenant/oauth2/v2.0/token -Body $body
+                $accessToken = $response.access_token
+        
+                $accessToken
+                if ($version -eq 2) {
+                    write-host "Version 2 module detected"
+                    $accesstokenfinal = ConvertTo-SecureString -String $accessToken -AsPlainText -Force
+                }
+                else {
+                    write-host "Version 1 Module Detected"
+                    Select-MgProfile -Name Beta
+                    $accesstokenfinal = $accessToken
+                }
+                $graph = Connect-MgGraph  -AccessToken $accesstokenfinal 
+                Write-Host "Connected to Intune tenant $TenantId using app-based authentication (Azure AD authentication not supported)"
+            }
+            else {
+                if ($version -eq 2) {
+                    write-host "Version 2 module detected"
+                }
+                else {
+                    write-host "Version 1 Module Detected"
+                    Select-MgProfile -Name Beta
+                }
+                $graph = Connect-MgGraph -scopes $scopes
+                Write-Host "Connected to Intune tenant $($graph.TenantId)"
+            }
+        }
+    }    
+
+    function getdevicesandusers() {
+        $alldevices = getallpagination -url "https://graph.microsoft.com/beta/devicemanagement/manageddevices"
+        $outputarray = @()
+        foreach ($value in $alldevices) {
+            $objectdetails = [pscustomobject]@{
+                DeviceID = $value.id
+                DeviceName = $value.deviceName
+                OSVersion = $value.operatingSystem
+                PrimaryUser = $value.userPrincipalName
+                operatingSystem = $value.operatingSystem
+                AADID = $value.azureActiveDirectoryDeviceId
+                SerialNumber = $value.serialnumber
+
+            }
+        
+        
+            $outputarray += $objectdetails
+        
+        }
+        
+        return $outputarray
+        }
+
+        function getallpagination () {
+            <#
+        .SYNOPSIS
+        This function is used to grab all items from Graph API that are paginated
+        .DESCRIPTION
+        The function connects to the Graph API Interface and gets all items from the API that are paginated
+        .EXAMPLE
+        getallpagination -url "https://graph.microsoft.com/v1.0/groups"
+        Returns all items
+        .NOTES
+        NAME: getallpagination
+        #>
+        [cmdletbinding()]
+            
+        param
+        (
+            $url
+        )
+            $response = (Invoke-MgGraphRequest -uri $url -Method Get -OutputType PSObject)
+            $alloutput = $response.value
+            
+            $alloutputNextLink = $response."@odata.nextLink"
+            
+            while ($null -ne $alloutputNextLink) {
+                $alloutputResponse = (Invoke-MGGraphRequest -Uri $alloutputNextLink -Method Get -outputType PSObject)
+                $alloutputNextLink = $alloutputResponse."@odata.nextLink"
+                $alloutput += $alloutputResponse.value
+            }
+            
+            return $alloutput
+            }
 
     Write-Host "Downloading and installing all required modules, please accept all prompts"
 
-    #Install-PackageProvider -Name NuGet
-    #Region - Check for AzureAD Module
-Write-Host("Checking if the AzureAD Module is installed.")
-if (Get-Module -ListAvailable -Name AzureAD) {
-    Write-Host "AzureAD is already installed" -ForegroundColor green
-}else{
-    try {
-        Write-Host("AzureAD is installing now") -ForegroundColor yellow
-        Install-Module -Name AzureAD -AllowClobber -Force
-    }
-    catch [Exception] {
-        $_.message
-        exit
-    }
-}
-#EndRegion - Check for AzureAD Module
+            # Get NuGet
+            $provider = Get-PackageProvider NuGet -ErrorAction Ignore
+            if (-not $provider) {
+                Write-Host "Installing provider NuGet"
+                Find-PackageProvider -Name NuGet -ForceBootstrap -IncludeDependencies
+            }
+            
+            # Get Graph Authentication module (and dependencies)
+            $module = Import-Module microsoft.graph.authentication -PassThru -ErrorAction Ignore
+            if (-not $module) {
+                Write-Host "Installing module microsoft.graph.authentication"
+                Install-Module microsoft.graph.authentication -Force -ErrorAction Ignore
+            }
+            Import-Module microsoft.graph.authentication -Scope Global
 
-    #WindowsAutoPilotIntune: https://www.powershellgallery.com/packages/WindowsAutoPilotIntune/5.0
-    Write-Host("
-    Checking if the WindowsAutoPilotIntune Module is installed.")
-    if (Get-Module -ListAvailable -Name WindowsAutoPilotIntune) {
-        Write-Host "    WindowsAutoPilotIntune is already installed!!" -ForegroundColor Green
-    }else {
-        try {
-            Write-Host("    WindowsAutoPilotIntune Module is installing now") -ForegroundColor Yellow
-            Install-Module -Name WindowsAutoPilotIntune -Force
-        }
-        catch [Exception] {
-            $_.message
-            exit
-        }
-    }
+                $module = Import-Module microsoft.graph.groups -PassThru -ErrorAction Ignore
+                if (-not $module) {
+                    Write-Host "Installing module MS Graph Groups"
+                    Install-Module microsoft.graph.groups -Force -ErrorAction Ignore
+                }
+                Import-Module microsoft.graph.groups -Scope Global
 
-    #Checking if Get-WindowsAutoPilotInfo.ps1 script is downloaded.")
-    $ScriptLocation = "C:\Program Files\WindowsPowerShell\Scripts\"
-    $AutoPilotInfoScript = "$ScriptLocation\Get-WindowsAutoPilotInfo.ps1"
-    $CheckAutoPilotInfo = Test-Path -Path $AutoPilotInfoScript -PathType Leaf
-    Write-Host "
-    Checking to See if $AutoPilotInfoScript  is already installed"
-    If($CheckAutoPilotInfo -eq 'True'){
-        Write-Host("    Get-WindowsAutoPilotInfo.ps1 looks like it installed fine. Congrats, next phase will commence.")
-    }Else{
-        Write-Host("    Downloading the Get-WindowsAutoPilotInfo.ps1 script now.") -ForegroundColor Yellow
-        Install-Script -Name Get-WindowsAutoPilotInfo -Force
-        }
 
-    Import-Module -Name WindowsAutoPilotIntune -Force
-    Install-Module Microsoft.Graph.Intune
+            $module2 = Import-Module Microsoft.Graph.Identity.DirectoryManagement -PassThru -ErrorAction Ignore
+            if (-not $module2) {
+                Write-Host "Installing module MS Graph Identity Management"
+                Install-Module Microsoft.Graph.Identity.DirectoryManagement -Force -ErrorAction Ignore
+            }
+            Import-Module microsoft.graph.Identity.DirectoryManagement -Scope Global
+
+            $module3 = Import-Module WindowsAutopilotIntuneCommunity -PassThru -ErrorAction Ignore
+            if (-not $module3) {
+                Write-Host "Installing module WindowsAutopilotIntuneCommunity"
+                Install-Module WindowsAutopilotIntuneCommunity -Force -ErrorAction Ignore
+            }
+            Import-Module WindowsAutopilotIntuneCommunity -Scope Global
+
 
     $session = New-CimSession
     $DomainIP = $null
@@ -580,51 +695,33 @@ if (Get-Module -ListAvailable -Name AzureAD) {
     Write-Host "Will be processing device with serial number: " -NoNewline
     Write-Host $serial -ForegroundColor Green
 
-    Write-Host "Connecting to AzureAD and Intune Graph"
+    Write-Host "Connecting to Intune Graph"
 
-    #Get global admin username if it's not provided already
-    While(($null -eq $GlobalAdmin) -or ($GlobalAdmin -eq "") -or ($GlobalAdmin -notlike "*@*")){
-        $GlobalAdmin = Read-Host '
-    What is username of the global admin you are running wanting to connect with?'
+    if ($AppId -ne "") {
+        Connect-ToGraph -Tenant $TenantId -AppId $AppId -AppSecret $AppSecret
+        Write-Host "Connected to Intune tenant $TenantId using app-based authentication (Azure AD authentication not supported)"
     }
-
-   #Connect to MS Graph if needed
-    Try{
-        $IntuneConnectionTest = Get-Groups
-        if($null -ne $IntuneConnectionTest){
-            Write-Host "Looks like you're already connected to MS Graph" -foregroundcolor green
-        }
-    }
-    Catch{
-        Write-Host "Connecting to MS Graph now." -foregroundcolor yellow
-        while($null -eq $IntuneConnectionTest){
-            Connect-MSGraph
-            $IntuneConnectionTest = Get-Groups
-        }
-    }
-
-    #Connect to AzureAD if it's not connected already
-    Try{
-        $AzureADConnectionTest = Get-AzureADTenantDetail
-        if(($null -ne $AzureADConnectionTest) -or ($AzureADConnectionTest -ne "")){
-            Write-Host "Looks like you're already connected to Azure AD" -foregroundcolor green
-        }
-
-    }
-    Catch{
-        while(($null -eq $AzureADConnectionTest) -or ($AzureADConnectionTest -eq "")){
-            Write-Host "Connecting to Azure AD now" -foregroundcolor yellow
-	        Connect-AzureAD -AccountId $GlobalAdmin
-            $AzureADConnectionTest = Get-AzureADTenantDetail
+    else {
+        $graph = Connect-ToGraph -scopes "Group.ReadWrite.All, Device.ReadWrite.All, DeviceManagementManagedDevices.ReadWrite.All, DeviceManagementServiceConfig.ReadWrite.All, GroupMember.ReadWrite.All"
+        Write-Host "Connected to Intune tenant $($graph.TenantId)"
+        if ($AddToGroup) {
+            $aadId = Connect-ToGraph -scopes "Group.ReadWrite.All, Device.ReadWrite.All, DeviceManagementManagedDevices.ReadWrite.All, DeviceManagementServiceConfig.ReadWrite.All, GroupMember.ReadWrite.All"
+            Write-Host "Connected to Azure AD tenant $($aadId.TenantId)"
         }
     }
 
     Write-Host "Loading all objects. This can take a while on large tenants"
-    $aadDevices = Get-AzureADDevice -All $true
-    $intuneDevices = Get-IntuneManagedDevice -Filter "contains(operatingsystem, 'Windows')" | Get-MSGraphAllPages
-    $autopilotDevices = Get-AutopilotDevice | Get-MSGraphAllPages
+    $aadDevices = getallpagination -url "https://graph.microsoft.com/beta/devices"
 
-    <# $localADfqdn = Read-Host -Prompt 'If you want to *DELETE* this computer from your local Active Directory domain and have Domain Controllers in line of sight, please enter the DNS of your AD DS domain (ie domain.local or contoso.com), otherwise, to skip AD DS deletion, hit "Enter"'
+    $devices = getdevicesandusers
+
+        $intunedevices = $devices | Where-Object {$_.operatingSystem -eq "Windows"}
+
+    ##$autopilotDevices = Get-AutopilotDevice | Get-MSGraphAllPages
+    $autopilotDevices = Get-AutopilotDevice
+
+
+    $localADfqdn = Read-Host -Prompt 'If you want to *DELETE* this computer from your local Active Directory domain and have Domain Controllers in line of sight, please enter the DNS of your AD DS domain (ie domain.local or contoso.com), otherwise, to skip AD DS deletion, hit "Enter"'
     if($localADfqdn -ne "" -and $localADfqdn -ne $null)
     {
         $DomainIP = (Test-Connection -ComputerName $localADfqdn -Count 1 -ErrorAction SilentlyContinue).IPV4Address.IPAddressToString
@@ -643,10 +740,10 @@ if (Get-Module -ListAvailable -Name AzureAD) {
         $ADPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($ADPassword))
         $de = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$DomainIP", $ADUserName, $ADPassword) -ErrorAction Stop
         Write-Host Connected to $de.distinguishedName   
-    } #>
+    }
 
 
-    $currentAutopilotDevice = $autopilotDevices | ? {$_.serialNumber -eq $serial}
+    $currentAutopilotDevice = $autopilotDevices | Where-Object {$_.serialNumber -eq $serial}
 
     if ($currentAutopilotDevice -ne $null)
     {
@@ -655,13 +752,13 @@ if (Get-Module -ListAvailable -Name AzureAD) {
 
         Write-Verbose $currentAutopilotDevice |  Format-List -Property *
         
-        [array]$relatedIntuneDevice = $intuneDevices | ? {
+        [array]$relatedIntuneDevice = $intuneDevices | Where-Object {
         $_.serialNumber -eq $currentAutopilotDevice.serialNumber -or 
         $_.serialNumber -eq $currentAutopilotDevice.serialNumber.replace(' ','') -or 
         $_.id -eq $currentAutopilotDevice.managedDeviceId -or 
         $_.azureADDeviceId -eq $currentAutopilotDevice.azureActiveDirectoryDeviceId}       
     
-        [array]$FoundAADDevices = $aadDevices | ? { 
+        [array]$FoundAADDevices = $aadDevices | Where-Object { 
             $_.DeviceId -eq $currentAutopilotDevice.azureActiveDirectoryDeviceId -or 
             $_.DeviceId -iin $relatedIntuneDevice.azureADDeviceId -or 
             $_.DevicePhysicalIds -match $currentAutopilotDevice.Id
@@ -688,7 +785,10 @@ if (Get-Module -ListAvailable -Name AzureAD) {
             foreach($relIntuneDevice in $relatedIntuneDevice)        {
                 $displayName=$relIntuneDevice.deviceName
                 if($Host.UI.PromptForChoice('Delete Intune Device', 'Do you want to *DELETE* ' + $relIntuneDevice.deviceName +' from the Intune?', @('&Yes'; '&No'), 1) -eq 0){
-                Remove-IntuneManagedDevice –managedDeviceId $relIntuneDevice.id -ErrorAction Continue
+                    $deviceid = $relIntuneDevice.id
+                    $url = "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$deviceid"
+                    $response = Invoke-MgGraphRequest -Uri $url -Method Delete -OutputType PSObject
+                #Remove-IntuneManagedDevice -managedDeviceId $relIntuneDevice.id -ErrorAction Continue
                 }
             }
 
@@ -698,18 +798,25 @@ if (Get-Module -ListAvailable -Name AzureAD) {
     
         if($Host.UI.PromptForChoice('Delete Autopilot Device', 'Do you want to *DELETE* the device with serial number ' + $currentAutopilotDevice.serialNumber +' from the Autopilot?', @('&Yes'; '&No'), 1) -eq 0){
         
-
-            Remove-AutopilotDevice -id $currentAutopilotDevice.id -ErrorAction Continue
+            $id = $currentAutopilotDevice.id
+            $graphApiVersion = "beta"
+            $Resource = "deviceManagement/windowsAutopilotDeviceIdentities"    
+            $uri = "https://graph.microsoft.com/$graphApiVersion/$Resource/$id"
+            Invoke-MGGraphRequest -Uri $uri -Method DELETE
+            #Remove-AutopilotDevice -id $currentAutopilotDevice.id -ErrorAction Continue
             $SecondsSinceLastSync = $null
             $SecondsSinceLastSync = (New-Timespan -Start (Get-AutopilotSyncInfo).lastSyncDateTime.ToUniversalTime()  -End (Get-Date).ToUniversalTime()).TotalSeconds
-            If ($SecondsSinceLastSync -ge 610){
+            If ($SecondsSinceLastSync -ge 610)
+            {
                 Invoke-AutopilotSync 
                 
-            }else{
+            }
+            else
+            {
                 Write-Host "Last sync was" $SecondsSinceLastSync "seconds ago, will sleep for" (610-$SecondsSinceLastSync) "seconds before trying to sync."
                 if($Host.UI.PromptForChoice('Autopilot Sync','Do you want to wait?', @('&Yes'; '&No'), 1) -eq 0){Start-Sleep -Seconds (610-$SecondsSinceLastSync) ; Invoke-AutopilotSync}            
             }
-            while (Get-AutopilotDevice | Get-MSGraphAllPages | ? {$_.serialNumber -eq $serial} -ne $null){
+            while (Get-AutopilotDevice  | Where-Object {$_.serialNumber -eq $serial} -ne $null){
                 Start-Sleep -Seconds 5                        
         }
         Write-Host "Deleted"
@@ -720,8 +827,8 @@ if (Get-Module -ListAvailable -Name AzureAD) {
 
     if($relatedIntuneDevice -eq $null -and $FoundAADDevices -eq $null ){
         # this serial number was not found in Autopilot Devices, but we still want to check intune devices with this serial number and search AAD and AD DS for that one
-        [array]$relatedIntuneDevice = $intuneDevices | ? {$_.serialNumber -eq $serial -or $_.serialNumber -eq $serial.replace(' ','')}
-        [array]$FoundAADDevices = $aadDevices | ? { $_.DeviceId -eq $relatedIntuneDevice.azureADDeviceId }
+        [array]$relatedIntuneDevice = $intuneDevices | Where-Object {$_.serialNumber -eq $serial -or $_.serialNumber -eq $serial.replace(' ','')}
+        [array]$FoundAADDevices = $aadDevices | Where-Object { $_.DeviceId -eq $relatedIntuneDevice.azureADDeviceId }
         Write-Host "Found Related Intune Devices:"
 
         $relatedIntuneDevice | Format-Table -Property deviceName, id, userID, enrolledDateTime, LastSyncDateTime, operatingSystem, osVersion, deviceEnrollmentType
@@ -735,7 +842,10 @@ if (Get-Module -ListAvailable -Name AzureAD) {
             foreach($relIntuneDevice in $relatedIntuneDevice)        {
                 $displayName=$relIntuneDevice.deviceName
                 if($Host.UI.PromptForChoice('Delete Intune Device', 'Do you want to *DELETE* ' + $relIntuneDevice.deviceName +' from the Intune?', @('&Yes'; '&No'), 1) -eq 0){
-                Remove-IntuneManagedDevice –managedDeviceId $relIntuneDevice.id -ErrorAction Stop
+                    $deviceid = $relIntuneDevice.id
+                    $url = "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$deviceid"
+                    $response = Invoke-MgGraphRequest -Uri $url -Method Delete -OutputType PSObject
+                #Remove-IntuneManagedDevice -managedDeviceId $relIntuneDevice.id -ErrorAction Stop
                 }
             }
 
@@ -747,7 +857,7 @@ if (Get-Module -ListAvailable -Name AzureAD) {
 
     foreach($aadDevice in $FoundAADDevices){
         if($de -ne $null){            
-            $escapedguid = “\” + ((([GUID]$aadDevice.deviceID).ToByteArray() |% {“{0:x}” -f $_}) -join ‘\’)
+            $escapedguid = "\" + ((([GUID]$aadDevice.deviceID).ToByteArray() |ForEach-Object {"{0:x}" -f $_}) -join '\')
             $searcher = New-Object System.DirectoryServices.DirectorySearcher($de,"(&(objectCategory=Computer)(ObjectGUID=$escapedguid))")
             $obj = $searcher.FindOne()
             if ($obj -ne $null){
@@ -761,7 +871,7 @@ if (Get-Module -ListAvailable -Name AzureAD) {
         }
         if($Host.UI.PromptForChoice('Delete Azure Active Directory Device', 'Do you want to *DELETE* the device with the name ' + $aadDevice.DisplayName +' from Azure AD?', @('&Yes'; '&No'), 1) -eq 0){
             
-            Remove-AzureADDevice -ObjectId $aadDevice.ObjectID -ErrorAction SilentlyContinue
+            Remove-mgdevice -DeviceId $aadDevice.Id -ErrorAction SilentlyContinue
         }
         
     }
@@ -774,20 +884,29 @@ if (Get-Module -ListAvailable -Name AzureAD) {
         $hash = $devDetail.DeviceHardwareData
         if($Host.UI.PromptForChoice('Add Autopilot Device', 'Do you want to *ADD* the device with serial number ' + $serial +' to Autopilot?', @('&Yes'; '&No'), 1) -eq 0){
             
-            $newuserPrincipalName = Read-Host -Prompt "Change assigned user [$userPrincipalName] (type a new value or hit enter to keep the old one)"
+            $newuserPrincipalName = Read-Host -Prompt "Change assigned user [$userPrincipalName] (type a new value or hit enter to keep the old one. Enter None to not set a user)"
             if (![string]::IsNullOrWhiteSpace($newuserPrincipalName)){ $userPrincipalName = $newuserPrincipalName }
 
             $newgroupTag = Read-Host -Prompt "Change group tag [$groupTag] (type a new value or hit enter to keep the old one)"
             if (![string]::IsNullOrWhiteSpace($newgroupTag)){ $groupTag = $newgroupTag }
-            
 
+            ##If "None has been selected, don't add assigneduser"
+            
+            if ($userPrincipalName -eq "None") {
+            Add-AutopilotImportedDevice -serialNumber $serial -hardwareIdentifier $hash -groupTag $groupTag
+            }
+            else {
             Add-AutopilotImportedDevice -serialNumber $serial -hardwareIdentifier $hash -groupTag $groupTag -assignedUser $userPrincipalName        
+            }
 
             $SecondsSinceLastSync = $null
             $SecondsSinceLastSync = (New-Timespan -Start (Get-AutopilotSyncInfo).lastSyncDateTime.ToUniversalTime()  -End (Get-Date).ToUniversalTime()).TotalSeconds
-            If ($SecondsSinceLastSync -ge 610){
+            If ($SecondsSinceLastSync -ge 610)
+            {
                 Invoke-AutopilotSync            
-            }else{
+            }
+            else
+            {
                 Write-Host "Last sync was" $SecondsSinceLastSync "seconds ago, will sleep for" (610-$SecondsSinceLastSync) "seconds before trying to sync."
                 if($Host.UI.PromptForChoice('Autopilot Sync','Do you want to wait?', @('&Yes'; '&No'), 0) -eq 0){Start-Sleep -Seconds (610-$SecondsSinceLastSync); Invoke-AutopilotSync}
                 
@@ -804,9 +923,9 @@ if (Get-Module -ListAvailable -Name AzureAD) {
         
             if (![string]::IsNullOrWhiteSpace($newdisplayName) ){ $displayName = $newdisplayName }
             
-            $autopilotDevices = Get-AutopilotDevice | Get-MSGraphAllPages
+            $autopilotDevices = Get-AutopilotDevice
 
-            [array]$currentAutopilotDevices = $autopilotDevices | ? {$_.serialNumber -eq $serial}
+            [array]$currentAutopilotDevices = $autopilotDevices | Where-Object {$_.serialNumber -eq $serial}
 
             foreach($currentAutopilotDevice in $currentAutopilotDevices){
             
@@ -817,13 +936,13 @@ if (Get-Module -ListAvailable -Name AzureAD) {
 
     }
 }
-#Pulled from here: https://www.powershellgallery.com/packages/Get-AutopilotESPStatus/4.1/Content/Get-AutopilotESPStatus.ps1
-Function Get-AutopilotESPStatus(){
+#Pulled from here: https://www.powershellgallery.com/packages/Get-AutopilotDiagnostics/5.6/Content/Get-AutopilotDiagnostics.ps1
+Function Get-AutopilotDiagnostics(){
     <#PSScriptInfo
     
-    .VERSION 4.1
+    .VERSION 5.6
     
-    .GUID 0f67a69a-b32f-4b56-a101-1394715d7fb5
+    .GUID 06025137-9010-4807-bd22-53464539dfa3
     
     .AUTHOR Michael Niehaus
     
@@ -846,62 +965,84 @@ Function Get-AutopilotESPStatus(){
     .EXTERNALSCRIPTDEPENDENCIES
     
     .RELEASENOTES
-    Version 4.1: Marked as obsolete; use Get-AutopilotDiagnostics instead.
-    Version 4.0: Added sidecar installation info.
-    Version 3.9: Bug fixes.
-    Version 3.8: Bug fixes.
+    Version 5.6: Fixed parameter handling
+    Version 5.5: Added support for a zip file
+    Version 5.4: Added additional ESP details
+    Version 5.3: Added hardware and OS version details
+    Version 5.2: Added device registration events
+    Version 5.1: Bug fixes
+    Version 5.0: Bug fixes
+    Version 4.9: Bug fixes
+    Version 4.8: Added Delivery Optimization results (but not when using a CAB file), ensured events are displayed even when no ESP
+    Version 4.7: Added ESP settings, fixed bugs
+    Version 4.6: Fixed typo
+    Version 4.5: Fixed but to properly reported Win32 app status when a Win32 app is installed during user ESP
+    Version 4.4: Added more ODJ info
+    Version 4.3: Added policy tracking
+    Version 4.2: Bug fixes for Windows 10 2004 (event ID changes)
+    Version 4.1: Renamed to Get-AutopilotDiagnostics
+    Version 4.0: Added sidecar installation info
+    Version 3.9: Bug fixes
+    Version 3.8: Bug fixes
     Version 3.7: Modified Office logic to ensure it accurately reflected what ESP thinks the status is. Added ShowPolicies option.
     Version 3.2: Fixed sidecar detection logic
     Version 3.1: Fixed ODJ applied output
     Version 3.0: Added the ability to process logs as well
     Version 2.2: Added new IME MSI guid, new -AllSessions switch
-    Version 2.0: Added -online parameter to look up app and policy details.
-    Version 1.0: Original published version.
+    Version 2.0: Added -online parameter to look up app and policy details
+    Version 1.0: Original published version
     
     #>
 
 
     <#
     .SYNOPSIS
-    Displays Windows Autopilot ESP tracking information from the current PC.
+    Displays Windows Autopilot diagnostics information from the current PC or a captured set of logs.
     
     .DESCRIPTION
+    This script displays diagnostics information from the current PC or a captured set of logs. This includes details about the Autopilot profile settings; policies, apps, certificate profiles, etc. being tracked via the Enrollment Status Page; and additional information.
     
-    *NOTE* This script has been replaced by Get-AutopilotDiagnostics, available from https://www.powershellgallery.com/packages/Get-AutopilotDiagnostics. As a result, this script is no longer being maintained or enhanced.
-    
-    This script dumps out the Windows Autopilot ESP tracking information from the registry. This should work with Windows 10 1903 and later (earlier versions have not been validated).
-    
-    This script will not work on ARM64 systems due to registry redirection from the use of x86 PowerShell.exe.
+    This should work with Windows 10 1903 and later (earlier versions have not been validated). This script will not work on ARM64 systems due to registry redirection from the use of x86 PowerShell.exe.
     
     .PARAMETER Online
-    Look up the actual policy names via the Intune Graph API
+    Look up the actual policy and app names via the Intune Graph API
     
     .PARAMETER AllSessions
-    Show all ESP sessions (where each session reflects one ESP execution, e.g. device ESP #1, device ESP #2 after a reboot, user) instead of just the last one.
+    Show all ESP progress instead of just the final details.
     
     .PARAMETER CABFile
     Processes the information in the specified CAB file (captured by MDMDiagnosticsTool.exe -area Autopilot -cab filename.cab) instead of from the registry.
     
+    .PARAMETER ZIPFile
+    Processes the information in the specified ZIP file (captured by MDMDiagnosticsTool.exe -area Autopilot -zip filename.zip) instead of from the registry.
+    
     .PARAMETER ShowPolicies
-    Shows the policy details as recorded in the NodeCache registry keys.
+    Shows the policy details as recorded in the NodeCache registry keys, in the order that the policies were received by the client.
     
     .EXAMPLE
-    .\Get-AutopilotESPStatus.ps1
+    .\Get-AutopilotDiagnostics.ps1
     
     .EXAMPLE
-    .\Get-AutopilotESPStatus.ps1 -Online
+    .\Get-AutopilotDiagnostics.ps1 -Online
     
     .EXAMPLE
     .\Get-AutopilotESPStatus.ps1 -AllSessions
     
     .EXAMPLE
-    .\Get-AutopilotESPStatus.ps1 -CABFile C:\Autopilot.cab -Online -AllSessions
+    .\Get-AutopilotDiagnostics.ps1 -CABFile C:\Autopilot.cab -Online -AllSessions
+    
+    .EXAMPLE
+    .\Get-AutopilotDiagnostics.ps1 -ZIPFile C:\Autopilot.zip
+    
+    .EXAMPLE
+    .\Get-AutopilotDiagnostics.ps1 -ShowPolicies
     
     #>
 
     [CmdletBinding()]
     param(
         [Parameter(Mandatory=$False)] [String] $CABFile = $null,
+        [Parameter(Mandatory=$False)] [String] $ZIPFile = $null,
         [Parameter(Mandatory=$False)] [Switch] $Online = $false,
         [Parameter(Mandatory=$False)] [Switch] $AllSessions = $false,
         [Parameter(Mandatory=$False)] [Switch] $ShowPolicies = $false
@@ -909,23 +1050,39 @@ Function Get-AutopilotESPStatus(){
 
     Begin
     {
-        # If using a CAB file, load up the registry information
-        if ($CABFile) {
+        # Process log files if needed
+        $script:useFile = $false
+        if ($CABFile -or $ZIPFile) {
 
-            # Extract the needed files
-            if (-not (Test-Path "$($env:TEMP)\ESPStatus.tmp"))
-            {
+            if (-not (Test-Path "$($env:TEMP)\ESPStatus.tmp")) {
                 New-Item -Path "$($env:TEMP)\ESPStatus.tmp" -ItemType "directory" | Out-Null
             }
-            $null = & expand.exe "$CABFile" -F:MdmDiagReport_RegistryDump.reg "$($env:TEMP)\ESPStatus.tmp\" 
-            if (-not (Test-Path "$($env:TEMP)\ESPStatus.tmp\MdmDiagReport_RegistryDump.reg"))
+            Remove-Item -Path "$($env:TEMP)\ESPStatus.tmp\*.*" -Force -Recurse        
+            $script:useFile = $true
+
+            # If using a CAB file, extract the needed files from it
+            if ($CABFile)
             {
-                Write-Error "Unable to extract registrion information from $CABFile"
+                $fileList = @("MdmDiagReport_RegistryDump.reg","microsoft-windows-devicemanagement-enterprise-diagnostics-provider-admin.evtx",
+                "microsoft-windows-user device registration-admin.evtx", "AutopilotDDSZTDFile.json", "*.csv")
+
+                $fileList | % {
+                    $null = & expand.exe "$CABFile" -F:$_ "$($env:TEMP)\ESPStatus.tmp\" 
+                    if (-not (Test-Path "$($env:TEMP)\ESPStatus.tmp\$_")) {
+                        Write-Error "Unable to extract $_ from $CABFile"
+                    }
+                }
             }
-            $null = & expand.exe "$CABFile" -F:microsoft-windows-devicemanagement-enterprise-diagnostics-provider-admin.evtx "$($env:TEMP)\ESPStatus.tmp\" 
-            if (-not (Test-Path "$($env:TEMP)\ESPStatus.tmp\microsoft-windows-devicemanagement-enterprise-diagnostics-provider-admin.evtx"))
-            {
-                Write-Error "Unable to extract event information from $CABFile"
+            else {
+                # If using a ZIP file, just extract the entire contents (not as easy to do selected files)
+                Expand-Archive -Path $ZIPFile -DestinationPath "$($env:TEMP)\ESPStatus.tmp\"
+            }
+
+            # Get the hardware hash information
+            $csvFile = (Get-ChildItem "$($env:TEMP)\ESPStatus.tmp\*.csv").FullName
+            if ($csvFile) {
+                $csv = Get-Content $csvFile | ConvertFrom-Csv
+                $hash = $csv.'Hardware Hash'
             }
 
             # Edit the path in the .reg file
@@ -939,8 +1096,7 @@ Function Get-AutopilotESPStatus(){
             $content | Add-Content -Path "$($env:TEMP)\ESPStatus.tmp\MdmDiagReport_Edited.reg"
 
             # Remove the registry info if it exists
-            if (Test-Path "HKCU:\ESPStatus.tmp")
-            {
+            if (Test-Path "HKCU:\ESPStatus.tmp") {
                 Remove-Item -Path "HKCU:\ESPStatus.tmp" -Recurse -Force
             }
 
@@ -955,7 +1111,9 @@ Function Get-AutopilotESPStatus(){
             $script:msiPath = "HKCU:\ESPStatus.tmp\MACHINE\Software\Microsoft\EnterpriseDesktopAppManagement"
             $script:officePath = "HKCU:\ESPStatus.tmp\MACHINE\Software\Microsoft\OfficeCSP"
             $script:sidecarPath = "HKCU:\ESPStatus.tmp\MACHINE\Software\Microsoft\IntuneManagementExtension\Win32Apps"
-        }else {
+            $script:enrollmentsPath =  "HKCU:\ESPStatus.tmp\MACHINE\software\microsoft\enrollments"
+        }
+        else {
             # Configure live constants
             $script:provisioningPath =  "HKLM:\software\microsoft\provisioning"
             $script:autopilotDiagPath = "HKLM:\software\microsoft\provisioning\Diagnostics\Autopilot"
@@ -964,14 +1122,20 @@ Function Get-AutopilotESPStatus(){
             $script:msiPath = "HKLM:\Software\Microsoft\EnterpriseDesktopAppManagement"
             $script:officePath = "HKLM:\Software\Microsoft\OfficeCSP"
             $script:sidecarPath = "HKLM:\Software\Microsoft\IntuneManagementExtension\Win32Apps"
+            $script:enrollmentsPath =  "HKLM:\Software\Microsoft\enrollments"
+
+            $hash = (Get-WmiObject -Namespace root/cimv2/mdm/dmmap -Class MDM_DevDetail_Ext01 -Filter "InstanceID='Ext' AND ParentID='./DevDetail'").DeviceHardwareData
         }
 
         # Configure other constants
-        $script:officeStatus = @{"10" = "Initialized"; "20" = "Download In Progress"; "25" = "Pending Download Retry";
+        $script:officeStatus = @{"0" = "None"; "10" = "Initialized"; "20" = "Download In Progress"; "25" = "Pending Download Retry";
             "30" = "Download Failed"; "40" = "Download Completed"; "48" = "Pending User Session"; "50" = "Enforcement In Progress"; 
             "55" = "Pending Enforcement Retry"; "60" = "Enforcement Failed"; "70" = "Success / Enforcement Completed"}
         $script:espStatus = @{"1" = "Not Installed"; "2" = "Downloading / Installing"; "3" = "Success / Installed"; "4" = "Error / Failed"}
         $script:policyStatus = @{"0" = "Not Processed"; "1" = "Processed"}
+
+        # Configure any other global variables
+        $script:observedTimeline = @()
     }
 
     Process
@@ -980,42 +1144,84 @@ Function Get-AutopilotESPStatus(){
         # Functions
         #------------------------
 
+        Function RecordStatus() {
+            param
+            (
+                [Parameter(Mandatory=$true)] [String] $detail,
+                [Parameter(Mandatory=$true)] [String] $status,
+                [Parameter(Mandatory=$true)] [String] $color,
+                [Parameter(Mandatory=$true)] [datetime] $date
+            )
+
+            # See if there is already an entry for this policy and status
+            $found = $script:observedTimeline | ? { $_.Detail -eq $detail -and $_.Status -eq $status }
+            if (-not $found) {
+                $script:observedTimeline += New-Object PSObject -Property @{
+                    "Date" = $date
+                    "Detail" = $detail
+                    "Status" = $status
+                    "Color" = $color
+                }
+            }
+        }
+
+        Function AddDisplay() {
+            param
+            (
+                [Parameter(Mandatory=$true)] [ref]$items
+            )
+            $items.Value | % {
+                Add-Member -InputObject $_ -NotePropertyName display -NotePropertyValue $AllSessions
+            }
+            $items.Value[$items.Value.Count - 1].display = $true
+        }
+        
         Function ProcessApps() {
         param
         (
             [Parameter(Mandatory=$true,ValueFromPipeline=$True)] [Microsoft.Win32.RegistryKey] $currentKey,
-            [Parameter(Mandatory=$true)] $currentUser
+            [Parameter(Mandatory=$true)] $currentUser,
+            [Parameter(Mandatory=$true,ValueFromPipelineByPropertyName=$True)] [bool] $display
         )
 
         Begin {
-            Write-Host "Apps:"
+            if ($display) { Write-Host "Apps:" }
         }
 
         Process {
-            Write-Host " $($currentKey.PSChildName)"
+            if ($display) { Write-Host " $(([datetime]$currentKey.PSChildName).ToString('u'))" }
             $currentKey.Property | % {
                 if ($_.StartsWith("./Device/Vendor/MSFT/EnterpriseDesktopAppManagement/MSI/")) {
                     $msiKey = [URI]::UnescapeDataString(($_.Split("/"))[6])
                     $fullPath = "$msiPath\$currentUser\MSI\$msiKey"
                     if (Test-Path $fullPath) {
-                        $status = Get-ItemPropertyValue -Path $fullPath -Name Status
-                        $msiFile = Get-ItemPropertyValue -Path $fullPath -Name CurrentDownloadUrl
-                    }else{
-                        $status = "Not found"
-                        $msiFile = "Unknown"
+                        $status = (Get-ItemProperty -Path $fullPath).Status
+                        $msiFile = (Get-ItemProperty -Path $fullPath).CurrentDownloadUrl
+                    }
+                    if ($status -eq "" -or $status -eq $null) {
+                        $status = 0
                     } 
-                    if ($msiFile -match "IntuneWindowsAgent.msi"){
+                    if ($msiFile -match "IntuneWindowsAgent.msi") {
                         $msiKey = "Intune Management Extensions ($($msiKey))"
-                    }elseif ($Online) {
+                    }
+                    elseif ($Online) {
                         $found = $apps | ? {$_.ProductCode -contains $msiKey}
                         $msiKey = "$($found.DisplayName) ($($msiKey))"
                     }
                     if ($status -eq 70) {
-                        Write-Host " MSI $msiKey : $status ($($officeStatus[$status.ToString()]))" -ForegroundColor Green
-                    }else {
-                        Write-Host " MSI $msiKey : $status ($($officeStatus[$status.ToString()]))" -ForegroundColor Yellow
+                        if ($display) { Write-Host " MSI $msiKey : $status ($($officeStatus[$status.ToString()]))" -ForegroundColor Green }
+                        RecordStatus -detail "MSI $msiKey" -status $officeStatus[$status.ToString()] -color "Green" -date $currentKey.PSChildName
                     }
-                }elseif ($_.StartsWith("./Vendor/MSFT/Office/Installation/")) {
+                    elseif ($status -eq 60) {
+                        if ($display) { Write-Host " MSI $msiKey : $status ($($officeStatus[$status.ToString()]))" -ForegroundColor Red }
+                        RecordStatus -detail "MSI $msiKey" -status $officeStatus[$status.ToString()] -color "Red" -date $currentKey.PSChildName
+                    }
+                    else {
+                        if ($display) { Write-Host " MSI $msiKey : $status ($($officeStatus[$status.ToString()]))" -ForegroundColor Yellow }
+                        RecordStatus -detail "MSI $msiKey" -status $officeStatus[$status.ToString()] -color "Yellow" -date $currentKey.PSChildName
+                    }
+                }
+                elseif ($_.StartsWith("./Vendor/MSFT/Office/Installation/")) {
                     # Report the main status based on what ESP is tracking
                     $status = Get-ItemPropertyValue -Path $currentKey.PSPath -Name $_
 
@@ -1033,22 +1239,27 @@ Function Get-AutopilotESPStatus(){
                                 $oStatus = "None"
                             }
                         }
-                    }else {
+                    }
+                    else {
                         $oStatus = "None"
                     }
-                    if ($officeStatus.Keys -contains $oStatus.ToString())
-                    {
+                    if ($officeStatus.Keys -contains $oStatus.ToString()) {
                         $officeStatusText = $officeStatus[$oStatus.ToString()]
-                    }else {
+                    }
+                    else {
                         $officeStatusText = $oStatus
                     }
                     if ($status -eq 1) {
-                        Write-Host " Office $officeKey : $status ($($policyStatus[$status.ToString()]) / $officeStatusText)" -ForegroundColor Green
-                    }else {
-                        Write-Host " Office $officeKey : $status ($($policyStatus[$status.ToString()]) / $officeStatusText)" -ForegroundColor Yellow
+                        if ($display) { Write-Host " Office $officeKey : $status ($($policyStatus[$status.ToString()]) / $officeStatusText)" -ForegroundColor Green }
+                        RecordStatus -detail "Office $officeKey" -status "$($policyStatus[$status.ToString()]) / $officeStatusText" -color "Green" -date $currentKey.PSChildName
                     }
-                }else{
-                    Write-Host " $_ : Unknown app"
+                    else {
+                        if ($display) { Write-Host " Office $officeKey : $status ($($policyStatus[$status.ToString()]) / $officeStatusText)" -ForegroundColor Yellow }
+                        RecordStatus -detail "Office $officeKey" -status "$($policyStatus[$status.ToString()]) / $officeStatusText" -color "Yellow" -date $currentKey.PSChildName
+                    }
+                }
+                else {
+                    if ($display) { Write-Host " $_ : Unknown app" }
                 }
             }
         }
@@ -1059,32 +1270,36 @@ Function Get-AutopilotESPStatus(){
         param
         (
             [Parameter(Mandatory=$true,ValueFromPipeline=$True)] [Microsoft.Win32.RegistryKey] $currentKey,
-            [Parameter(Mandatory=$true)] $currentUser
+            [Parameter(Mandatory=$true)] $currentUser,
+            [Parameter(Mandatory=$true,ValueFromPipelineByPropertyName=$True)] [bool] $display
         )
 
         Begin {
-            Write-Host "Modern Apps:"
+            if ($display) { Write-Host "Modern Apps:" }
         }
 
         Process {
-            Write-Host " $($currentKey.PSChildName)"
+            if ($display) { Write-Host " $(([datetime]$currentKey.PSChildName).ToString('u'))" }
             $currentKey.Property | % {
                 $status = (Get-ItemPropertyValue -path $currentKey.PSPath -Name $_).ToString()
                 if ($_.StartsWith("./User/Vendor/MSFT/EnterpriseModernAppManagement/AppManagement/")) {
                     $appID = [URI]::UnescapeDataString(($_.Split("/"))[7])
                     $type = "User UWP"
-                }elseif ($_.StartsWith("./Device/Vendor/MSFT/EnterpriseModernAppManagement/AppManagement/")) {
+                }
+                elseif ($_.StartsWith("./Device/Vendor/MSFT/EnterpriseModernAppManagement/AppManagement/")) {
                     $appID = [URI]::UnescapeDataString(($_.Split("/"))[7])
                     $type = "Device UWP"
-                }else
-                {
+                }
+                else {
                     $appID = $_
                     $type = "Unknown UWP"
                 }
                 if ($status -eq "1") {
-                    Write-Host " $type $appID : $status ($($policyStatus[$status]))" -ForegroundColor Green
-                }else {
-                    Write-Host " $type $appID : $status ($($policyStatus[$status]))" -ForegroundColor Yellow
+                    if ($display) { Write-Host " $type $appID : $status ($($policyStatus[$status]))" -ForegroundColor Green }
+                    RecordStatus -detail "UWP $appID" -status $policyStatus[$status] -color "Green" -date $currentKey.PSChildName
+                }
+                else {
+                    if ($display) { Write-Host " $type $appID : $status ($($policyStatus[$status]))" -ForegroundColor Yellow }
                 }
             }
         }
@@ -1095,15 +1310,16 @@ Function Get-AutopilotESPStatus(){
         param
         (
             [Parameter(Mandatory=$true,ValueFromPipeline=$True)] [Microsoft.Win32.RegistryKey] $currentKey,
-            [Parameter(Mandatory=$true)] $currentUser
+            [Parameter(Mandatory=$true)] $currentUser,
+            [Parameter(Mandatory=$true,ValueFromPipelineByPropertyName=$True)] [bool] $display
         )
 
         Begin {
-            Write-Host "Sidecar apps:"
+            if ($display) { Write-Host "Sidecar apps:" }
         }
 
         Process {
-            Write-Host " $($currentKey.PSChildName)"
+            if ($display) { Write-Host " $(([datetime]$currentKey.PSChildName).ToString('u'))" }
             $currentKey.Property | % {
                 $win32Key = [URI]::UnescapeDataString(($_.Split("/"))[9])
                 $status = Get-ItemPropertyValue -path $currentKey.PSPath -Name $_
@@ -1114,22 +1330,36 @@ Function Get-AutopilotESPStatus(){
                 $appGuid = $win32Key.Substring(9)
                 $sidecarApp = "$sidecarPath\$currentUser\$appGuid"
                 $exitCode = $null
-                if (Test-Path $sidecarApp)
-                {
+                if (Test-Path $sidecarApp) {
                     $exitCode = (Get-ItemProperty -Path $sidecarApp).ExitCode
                 }
                 if ($status -eq "3") {
                     if ($exitCode -ne $null) {
-                        Write-Host " Win32 $win32Key : $status ($($espStatus[$status.ToString()]), rc = $exitCode)" -ForegroundColor Green
-                    }else {
-                        Write-Host " Win32 $win32Key : $status ($($espStatus[$status.ToString()]))" -ForegroundColor Green
+                        if ($display) { Write-Host " Win32 $win32Key : $status ($($espStatus[$status.ToString()]), rc = $exitCode)" -ForegroundColor Green }
                     }
-                }else {
-                    if ($exitCode -ne $null)
-                    {
-                        Write-Host " Win32 $win32Key : $status ($($espStatus[$status.ToString()]), rc = $exitCode)" -ForegroundColor Yellow
-                    }else {
-                        Write-Host " Win32 $win32Key : $status ($($espStatus[$status.ToString()]))" -ForegroundColor Yellow
+                    else {
+                        if ($display) { Write-Host " Win32 $win32Key : $status ($($espStatus[$status.ToString()]))" -ForegroundColor Green }
+                    }
+                    RecordStatus -detail "Win32 $win32Key" -status $espStatus[$status.ToString()] -color "Green" -date $currentKey.PSChildName
+                }
+                elseif ($status -eq "4") {
+                    if ($exitCode -ne $null) {
+                        if ($display) { Write-Host " Win32 $win32Key : $status ($($espStatus[$status.ToString()]), rc = $exitCode)" -ForegroundColor Red }
+                    }
+                    else {
+                        if ($display) { Write-Host " Win32 $win32Key : $status ($($espStatus[$status.ToString()]))" -ForegroundColor Red }
+                    }
+                    RecordStatus -detail "Win32 $win32Key" -status $espStatus[$status.ToString()] -color "Red" -date $currentKey.PSChildName
+                }
+                else {
+                    if ($exitCode -ne $null) {
+                        if ($display) { Write-Host " Win32 $win32Key : $status ($($espStatus[$status.ToString()]), rc = $exitCode)" -ForegroundColor Yellow }
+                    }
+                    else {
+                        if ($display) { Write-Host " Win32 $win32Key : $status ($($espStatus[$status.ToString()]))" -ForegroundColor Yellow }
+                    }
+                    if ($status -ne "1") {
+                        RecordStatus -detail "Win32 $win32Key" -status $espStatus[$status.ToString()] -color "Yellow" -date $currentKey.PSChildName
                     }
                 }
             }
@@ -1140,36 +1370,43 @@ Function Get-AutopilotESPStatus(){
         Function ProcessPolicies() {
         param
         (
-            [Parameter(Mandatory=$true,ValueFromPipeline=$True)] [Microsoft.Win32.RegistryKey] $currentKey
+            [Parameter(Mandatory=$true,ValueFromPipeline=$True)] [Microsoft.Win32.RegistryKey] $currentKey,
+            [Parameter(Mandatory=$true,ValueFromPipelineByPropertyName=$True)] [bool] $display
         )
 
         Begin {
-            Write-Host "Policies:"
+            if ($display) { Write-Host "Policies:" }
         }
 
         Process {
-            Write-Host " $($currentKey.PSChildName)"
+            if ($display) { Write-Host " $(([datetime]$currentKey.PSChildName).ToString('u'))" }
             $currentKey.Property | % {
                 $status = Get-ItemPropertyValue -path $currentKey.PSPath -Name $_
-                Write-Host " Policy $_ : $status ($($policyStatus[$status.ToString()]))"
+                if ($status -eq "1") {
+                    if ($display) { Write-Host " Policy $_ : $status ($($policyStatus[$status.ToString()]))" -ForegroundColor Green }
+                    RecordStatus -detail "Policy $_" -status $policyStatus[$status.ToString()] -color "Green" -date $currentKey.PSChildName
+                }
+                else {
+                    if ($display) { Write-Host " Policy $_ : $status ($($policyStatus[$status.ToString()]))" -ForegroundColor Yellow }
+                }
             }
         }
 
         }
 
-
         Function ProcessCerts() {
         param
         (
-            [Parameter(Mandatory=$true,ValueFromPipeline=$True)] [Microsoft.Win32.RegistryKey] $currentKey
+            [Parameter(Mandatory=$true,ValueFromPipeline=$True)] [Microsoft.Win32.RegistryKey] $currentKey,
+            [Parameter(Mandatory=$true,ValueFromPipelineByPropertyName=$True)] [bool] $display
         )
 
         Begin {
-            Write-Host "Certificates:"
+            if ($display) { Write-Host "Certificates:" }
         }
 
         Process {
-            Write-Host " $($currentKey.PSChildName)"
+            if ($display) { Write-Host " $(([datetime]$currentKey.PSChildName).ToString('u'))" }
             $currentKey.Property | % {
                 $certKey = [URI]::UnescapeDataString(($_.Split("/"))[6])
                 $status = Get-ItemPropertyValue -path $currentKey.PSPath -Name $_
@@ -1178,9 +1415,11 @@ Function Get-AutopilotESPStatus(){
                     $certKey = "$($found.DisplayName) ($($certKey))"
                 }
                 if ($status -eq "1") {
-                    Write-Host " Cert $certKey : $status ($($policyStatus[$status.ToString()]))" -ForegroundColor Green
-                }else {
-                    Write-Host " Cert $certKey : $status ($($policyStatus[$status.ToString()]))" -ForegroundColor Yellow
+                    if ($display) { Write-Host " Cert $certKey : $status ($($policyStatus[$status.ToString()]))" -ForegroundColor Green }
+                    RecordStatus -detail "Cert $certKey" -status $policyStatus[$status.ToString()] -color "Green" -date $currentKey.PSChildName
+                }
+                else {
+                    if ($display) { Write-Host " Cert $certKey : $status ($($policyStatus[$status.ToString()]))" -ForegroundColor Yellow }
                 }
             }
         }
@@ -1189,11 +1428,6 @@ Function Get-AutopilotESPStatus(){
 
         Function ProcessNodeCache() {
 
-        Begin {
-            Write-Host " "
-            Write-Host "Policies processed:"
-        }
-        
         Process {
             $nodeCount = 0
             while ($true) {
@@ -1201,8 +1435,7 @@ Function Get-AutopilotESPStatus(){
                 # but it will work out OK shortly after provisioning. The alternative would be to get all the subkeys and then sort
                 # them numerically instead of alphabetically, but that can be saved for later...
                 $node = Get-ItemProperty "$provisioningPath\NodeCache\CSP\Device\MS DM Server\Nodes\$nodeCount" -ErrorAction SilentlyContinue
-                if ($node -eq $null)
-                {
+                if ($node -eq $null) {
                     break
                 }
                 $nodeCount += 1
@@ -1212,23 +1445,78 @@ Function Get-AutopilotESPStatus(){
 
         }
 
-        Function ProcessSidecarInfo() {
+        Function ProcessEvents() {
 
             Process {
-                Get-ChildItem -path "$msiPath\S-0-0-00-0000000000-0000000000-000000000-000\MSI" | % {
-                    $file = Get-ItemPropertyValue -Path $_.PSPath -Name CurrentDownloadUrl
-                    if ($file -match "IntuneWindowsAgent.msi")
-                    {
-                        $productCode = Get-ItemPropertyValue -Path $_.PSPath -Name ProductCode
-                        Write-Host " "
-                        Write-Host "INTUNE MANAGEMENT EXTENSIONS installation details:"
-                        if ($CABFile) {
-                            Get-WinEvent -Path "$($env:TEMP)\ESPStatus.tmp\microsoft-windows-devicemanagement-enterprise-diagnostics-provider-admin.evtx" -Oldest | ? {($_.Message -match $productCode -and $_.Id -in 1905,1906,1920,1922) -or $_.Id -eq 72}
-                        }else {
-                            Get-WinEvent -LogName Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Admin -Oldest | ? {($_.Message -match $productCode -and $_.Id -in 1905,1906,1920,1922) -or $_.Id -eq 72}
+
+                $productCode = 'IME-Not-Yet-Installed'
+                if (Test-Path "$msiPath\S-0-0-00-0000000000-0000000000-000000000-000\MSI") {
+                    Get-ChildItem -path "$msiPath\S-0-0-00-0000000000-0000000000-000000000-000\MSI" | % {
+                        $file = (Get-ItemProperty -Path $_.PSPath).CurrentDownloadUrl
+                        if ($file -match "IntuneWindowsAgent.msi") {
+                            $productCode = Get-ItemPropertyValue -Path $_.PSPath -Name ProductCode
                         }
                     }
                 }
+
+                # Process device management events
+                if ($script:useFile) {
+                    $events = Get-WinEvent -Path "$($env:TEMP)\ESPStatus.tmp\microsoft-windows-devicemanagement-enterprise-diagnostics-provider-admin.evtx" -Oldest | ? { ($_.Message -match $productCode -and $_.Id -in 1905,1906,1920,1922) -or $_.Id -in (72,100,107,109,110,111) }
+                }
+                else {
+                    $events = Get-WinEvent -LogName Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Admin -Oldest | ? { ($_.Message -match $productCode -and $_.Id -in 1905,1906,1920,1922) -or $_.Id -in (72,100,107,109,110,111) }
+                }
+                $events | % {
+                    $message = $_.Message
+                    $detail = "Sidecar"
+                    $color = "Yellow"
+                    $event = $_
+                    switch ($_.id)
+                    {
+                        {$_ -in (110, 109)} { 
+                            $detail = "Offline Domain Join"
+                            switch ($event.Properties[0].Value)
+                            {
+                                0 { $message = "Offline domain join not configured" }
+                                1 { $message = "Waiting for ODJ blob" }
+                                2 { $message = "Processed ODJ blob" }
+                                3 { $message = "Timed out waiting for ODJ blob or connectivity" }
+                            }
+                        }
+                        111 { $detail = "Offline Domain Join"; $message = "Starting wait for ODJ blob"}
+                        107 { $detail = "Offline Domain Join"; $message = "Successfully applied ODJ blob"}
+                        100 { $detail = "Offline Domain Join"; $message = "Could not establish connectivity"; $color = "Red"}
+                        72 { $detail = "MDM Enrollment" }
+                        1905 { $message = "Download started" }
+                        1906 { $message = "Download finished" }
+                        1920 { $message = "Installation started" }
+                        1922 { $message = "Installation finished" }
+                        {$_ -in (1922, 72)} { $color = "Green" }
+                    }
+                    RecordStatus -detail $detail -date $_.TimeCreated -status $message -color $color
+                }
+
+                # Process device registration events
+                if ($script:useFile) {
+                    $events = Get-WinEvent -Path "$($env:TEMP)\ESPStatus.tmp\microsoft-windows-user device registration-admin.evtx" -Oldest | ? { $_.Id -in (306, 101) }
+                }
+                else {
+                    $events = Get-WinEvent -LogName 'Microsoft-Windows-User Device Registration/Admin' -Oldest | ? { $_.Id -in (306, 101) }
+                }
+                $events | % {
+                    $message = $_.Message
+                    $detail = "Device Registration"
+                    $color = "Yellow"
+                    $event = $_
+                    switch ($_.id)
+                    {
+                        101 { $detail = "Device Registration"; $message = "SCP discovery successful." }
+                        304 { $detail = "Device Registration"; $message = "Hybrid AADJ device registration failed." }
+                        306 { $detail = "Device Registration"; $message = "Hybrid AADJ device registration succeeded."; $color = 'Green' }
+                    }
+                    RecordStatus -detail $detail -date $_.TimeCreated -status $message -color $color
+                }
+
             }
         
             }
@@ -1269,40 +1557,6 @@ Function Get-AutopilotESPStatus(){
         # Main code
         #------------------------
 
-        # Display Autopilot diag details
-        if (Test-Path $autopilotDiagPath)
-        {
-            Write-Host ""
-            Write-Host "AUTOPILOT DIAGNOSTICS"
-            Write-Host ""
-
-            $values = Get-ItemProperty "$autopilotDiagPath"
-            Write-Host "TenantDomain: $($values.CloudAssignedTenantDomain)"
-            Write-Host "TenantID: $($values.CloudAssignedTenantId)"
-            Write-Host "OobeConfig: $($values.CloudAssignedOobeConfig)"
-            $values = Get-ItemProperty "$autopilotDiagPath\EstablishedCorrelations"
-            Write-Host "EntDMID: $($values.EntDMID)"
-            if (Test-Path "$omadmPath\SyncML\ODJApplied")
-            {
-                Write-Host "ODJ applied: YES"
-            }
-        }
-
-        # Display sidecar info
-        ProcessSidecarInfo
-
-        # Display the list of policies
-        if ($ShowPolicies)
-        {
-            ProcessNodeCache | Format-Table -Wrap
-        }
-        
-        # Make sure the tracking path exists
-        if (-not (Test-Path $path)) {
-            Write-Host "ESP diagnostics info does not (yet) exist."
-            exit 0
-        }
-
         # If online, make sure we are able to authenticate
         if ($Online) {
 
@@ -1324,101 +1578,293 @@ Function Get-AutopilotESPStatus(){
             Write-Host "Getting list of policies"
             $script:policies = GetIntuneObjects("https://graph.microsoft.com/beta/deviceManagement/deviceConfigurations")
         }
+
+        # Display Autopilot diag details
+        Write-Host ""
+        Write-Host "AUTOPILOT DIAGNOSTICS" -ForegroundColor Magenta
+        Write-Host ""
+
+        $values = Get-ItemProperty "$autopilotDiagPath"
+        if (-not $values.CloudAssignedTenantId) {
+            Write-Host "This is not an Autopilot device.`n"
+            exit 0
+        }
+
+        if (-not $script:useFile) {
+            $osVersion = (Get-WmiObject win32_operatingsystem).Version
+            Write-Host "OS version: $osVersion"
+        }
+        Write-Host "Profile: $($values.DeploymentProfileName)"
+        Write-Host "TenantDomain: $($values.CloudAssignedTenantDomain)"
+        Write-Host "TenantID: $($values.CloudAssignedTenantId)"
+        $correlations = Get-ItemProperty "$autopilotDiagPath\EstablishedCorrelations"
+        Write-Host "ZTDID: $($correlations.ZTDRegistrationID)"
+        Write-Host "EntDMID: $($correlations.EntDMID)"
+
+        Write-Host "OobeConfig: $($values.CloudAssignedOobeConfig)"
+
+        if (($values.CloudAssignedOobeConfig -band 1024) -gt 0) {
+            Write-Host " Skip keyboard: Yes 1 - - - - - - - - - -"
+        }
+        else {
+            Write-Host " Skip keyboard: No 0 - - - - - - - - - -"
+        }
+        if (($values.CloudAssignedOobeConfig -band 512) -gt 0) {
+            Write-Host " Enable patch download: Yes - 1 - - - - - - - - -"
+        }
+        else {
+            Write-Host " Enable patch download: No - 0 - - - - - - - - -"
+        }
+        if (($values.CloudAssignedOobeConfig -band 256) -gt 0) {
+            Write-Host " Skip Windows upgrade UX: Yes - - 1 - - - - - - - -"
+        }
+        else {
+            Write-Host " Skip Windows upgrade UX: No - - 0 - - - - - - - -"
+        }
+        if (($values.CloudAssignedOobeConfig -band 128) -gt 0) {
+            Write-Host " AAD TPM Required: Yes - - - 1 - - - - - - -"
+        }
+        else {
+            Write-Host " AAD TPM Required: No - - - 0 - - - - - - -"
+        }
+        if (($values.CloudAssignedOobeConfig -band 64) -gt 0) {
+            Write-Host " AAD device auth: Yes - - - - 1 - - - - - -"
+        }
+        else {
+            Write-Host " AAD device auth: No - - - - 0 - - - - - -"
+        }
+        if (($values.CloudAssignedOobeConfig -band 32) -gt 0) {
+            Write-Host " TPM attestation: Yes - - - - - 1 - - - - -"
+        }
+        else {
+            Write-Host " TPM attestation: No - - - - - 0 - - - - -"
+        }
+        if (($values.CloudAssignedOobeConfig -band 16) -gt 0) {
+            Write-Host " Skip EULA: Yes - - - - - - 1 - - - -"
+        }
+        else {
+            Write-Host " Skip EULA: No - - - - - - 0 - - - -"
+        }
+        if (($values.CloudAssignedOobeConfig -band 8) -gt 0) {
+            Write-Host " Skip OEM registration: Yes - - - - - - - 1 - - -"
+        }
+        else {
+            Write-Host " Skip OEM registration: No - - - - - - - 0 - - -"
+        }
+        if (($values.CloudAssignedOobeConfig -band 4) -gt 0) {
+            Write-Host " Skip express settings: Yes - - - - - - - - 1 - -"
+        }
+        else {
+            Write-Host " Skip express settings: No - - - - - - - - 0 - -"
+        }
+        if (($values.CloudAssignedOobeConfig -band 2) -gt 0) {
+            Write-Host " Disallow admin: Yes - - - - - - - - - 1 -"
+        }
+        else {
+            Write-Host " Disallow admin: No - - - - - - - - - 0 -"
+        }
+
+        # In theory we could read these values from the profile cache registry key, but it's so bungled
+        # up in the registry export that it doesn't import without some serious massaging for embedded
+        # quotes. So this is easier.
+        if ($script:useFile) {
+            $jsonFile = "$($env:TEMP)\ESPStatus.tmp\AutopilotDDSZTDFile.json"
+        }
+        else {
+            $jsonFile = "$($env:WINDIR)\ServiceState\wmansvc\AutopilotDDSZTDFile.json" 
+        }
+        if (Test-Path $jsonFile) {
+            $json = Get-Content $jsonFile | ConvertFrom-Json
+            $date = [datetime]$json.PolicyDownloadDate
+            RecordStatus -date $date -detail "Autopilot profile" -status "Profile downloaded" -color "Yellow" 
+            if ($json.CloudAssignedDomainJoinMethod -eq 1) {
+                Write-Host "Scenario: Hybrid Azure AD Join"
+                if (Test-Path "$omadmPath\SyncML\ODJApplied") {
+                    Write-Host "ODJ applied: Yes"
+                }
+                else {
+                    Write-Host "ODJ applied: No"                
+                }
+                if ($json.HybridJoinSkipDCConnectivityCheck -eq 1) {
+                    Write-Host "Skip connectivity check: Yes"
+                }
+                else {
+                    Write-Host "Skip connectivity check: No"
+                }
+
+            }
+            else {
+                Write-Host "Scenario: Azure AD Join"
+            }
+        }
+        else {
+            Write-Host "Scenario: Not available (JSON not found)"
+        }
+
+        # Get ESP properties
+        Get-ChildItem $enrollmentsPath | ? { Test-Path "$($_.PSPath)\FirstSync" } | % {
+            $properties = Get-ItemProperty "$($_.PSPath)\FirstSync"
+            Write-Host "Enrollment status page:"
+            Write-Host " Device ESP enabled: $($properties.SkipDeviceStatusPage -eq 0)"
+            Write-Host " User ESP enabled: $($properties.SkipUserStatusPage -eq 0)"
+            Write-Host " ESP timeout: $($properties.SyncFailureTimeout)"
+            if ($properties.BlockInStatusPage -eq 0) {
+                Write-Host " ESP blocking: No"
+            }
+            else {
+                Write-Host " ESP blocking: Yes"
+                if ($properties.BlockInStatusPage -band 1) {
+                    Write-Host " ESP allow reset: Yes"
+                }
+                if ($properties.BlockInStatusPage -band 2) {
+                    Write-Host " ESP allow try again: Yes"
+                }
+                if ($properties.BlockInStatusPage -band 4) {
+                    Write-Host " ESP continue anyway: Yes"
+                }
+            }
+        }
+
+        # Get Delivery Optimization statistics (when available)
+        if (-not $script:useFile) {
+            $stats = Get-DeliveryOptimizationPerfSnapThisMonth
+            if ($stats.DownloadHttpBytes -ne 0)
+            {
+                $peerPct = [math]::Round( ($stats.DownloadLanBytes / $stats.DownloadHttpBytes) * 100 )
+                $ccPct = [math]::Round( ($stats.DownloadCacheHostBytes / $stats.DownloadHttpBytes) * 100 )
+            }
+            else {
+                $peerPct = 0
+                $ccPct = 0
+            }
+            Write-Host "Delivery Optimization statistics:"
+            Write-Host " Total bytes downloaded: $($stats.DownloadHttpBytes)"
+            Write-Host " From peers: $($peerPct)% ($($stats.DownloadLanBytes))"
+            Write-host " From Connected Cache: $($ccPct)% ($($stats.DownloadCacheHostBytes))"
+        }
+
+        # If the ADK is installed, get some key hardware hash info
+        $adkPath = Get-ItemPropertyValue "HKLM:\Software\Microsoft\Windows Kits\Installed Roots" -Name KitsRoot10 -ErrorAction SilentlyContinue
+        $oa3Tool = "$adkPath\Assessment and Deployment Kit\Deployment Tools\$($env:PROCESSOR_ARCHITECTURE)\Licensing\OA30\oa3tool.exe"
+        if ($hash -and (Test-Path $oa3Tool)) {
+            $commandLineArgs = "/decodehwhash:$hash"
+            $output = & "$oa3Tool" $commandLineArgs
+            [xml] $hashXML = $output | Select -skip 8 -First ($output.Count - 12)
+            Write-Host "Hardware information:"
+            Write-Host " Operating system build: " $hashXML.SelectSingleNode("//p[@n='OsBuild']").v
+            Write-Host " Manufacturer: " $hashXML.SelectSingleNode("//p[@n='SmbiosSystemManufacturer']").v
+            Write-Host " Model: " $hashXML.SelectSingleNode("//p[@n='SmbiosSystemProductName']").v
+            Write-Host " Serial number: " $hashXML.SelectSingleNode("//p[@n='SmbiosSystemSerialNumber']").v
+            Write-Host " TPM version: " $hashXML.SelectSingleNode("//p[@n='TPMVersion']").v
+        }
         
-        # Process device ESP sessions
-        Write-Host " "
-        Write-Host "DEVICE ESP:"
-        Write-Host " "
+        # Process event log info
+        ProcessEvents
 
-        if (Test-Path "$path\ExpectedMSIAppPackages") {
-            $items = Get-ChildItem "$path\ExpectedMSIAppPackages"
-            if ($AllSessions) {
-                $items | ProcessApps -currentUser "S-0-0-00-0000000000-0000000000-000000000-000"
-            }elseif ($items.Count -gt 0) {
-                $items[$items.Count - 1] | ProcessApps -currentUser "S-0-0-00-0000000000-0000000000-000000000-000"
-            }
+        # Display the list of policies
+        if ($ShowPolicies) {
+            Write-Host " "
+            Write-Host "POLICIES PROCESSED" -ForegroundColor Magenta   
+            ProcessNodeCache | Format-Table -Wrap
         }
-        if (Test-Path "$path\ExpectedModernAppPackages") {
-            $items = Get-ChildItem "$path\ExpectedModernAppPackages"
-            if ($AllSessions) {
-                $items | ProcessModernApps -currentUser "S-0-0-00-0000000000-0000000000-000000000-000"
-            }elseif ($items.Count -gt 0) {
-                $items[$items.Count - 1] | ProcessModernApps -currentUser "S-0-0-00-0000000000-0000000000-000000000-000"
-            }
-        }
-        if (Test-Path "$path\Sidecar") {
-            $items = Get-ChildItem "$path\Sidecar"
-            if ($AllSessions) {
-                $items | ProcessSidecar -currentUser "00000000-0000-0000-0000-000000000000"
-            }elseif ($items.Count -gt 0) {
-                $items[$items.Count - 1] | ProcessSidecar -currentUser "00000000-0000-0000-0000-000000000000"
-            }
-        }
-        if (Test-Path "$path\ExpectedPolicies") {
-            $items = Get-ChildItem "$path\ExpectedPolicies" 
-            if ($AllSessions) {
+        
+        # Make sure the tracking path exists
+        if (Test-Path $path) {
+
+            # Process device ESP sessions
+            Write-Host " "
+            Write-Host "DEVICE ESP:" -ForegroundColor Magenta
+            Write-Host " "
+
+            if (Test-Path "$path\ExpectedPolicies") {
+                [array]$items = Get-ChildItem "$path\ExpectedPolicies"
+                AddDisplay ([ref]$items)
                 $items | ProcessPolicies
-            }elseif ($items.Count -gt 0) {
-                $items[$items.Count - 1] | ProcessPolicies
+            }
+            if (Test-Path "$path\ExpectedMSIAppPackages") {
+                [array]$items = Get-ChildItem "$path\ExpectedMSIAppPackages"
+                AddDisplay ([ref]$items)
+                $items | ProcessApps -currentUser "S-0-0-00-0000000000-0000000000-000000000-000" 
+            }
+            if (Test-Path "$path\ExpectedModernAppPackages") {
+                [array]$items = Get-ChildItem "$path\ExpectedModernAppPackages"
+                AddDisplay ([ref]$items)
+                $items | ProcessModernApps -currentUser "S-0-0-00-0000000000-0000000000-000000000-000"
+            }
+            if (Test-Path "$path\Sidecar") {
+                [array]$items = Get-ChildItem "$path\Sidecar" | ? { $_.Property -match "./Device" }
+                AddDisplay ([ref]$items)
+                $items | ProcessSidecar -currentUser "00000000-0000-0000-0000-000000000000"
+            }
+            if (Test-Path "$path\ExpectedSCEPCerts") {
+                [array]$items = Get-ChildItem "$path\ExpectedSCEPCerts"
+                AddDisplay ([ref]$items)
+                $items | ProcessCerts
+            }
+
+            # Process user ESP sessions
+            Get-ChildItem "$path" | ? { $_.PSChildName.StartsWith("S-") } | % {
+                $userPath = $_.PSPath
+                $userSid = $_.PSChildName
+                Write-Host " "
+                Write-Host "USER ESP for $($userSid):" -ForegroundColor Magenta
+                Write-Host " "
+                if (Test-Path "$userPath\ExpectedPolicies") {
+                    [array]$items = Get-ChildItem "$userPath\ExpectedPolicies"
+                    AddDisplay ([ref]$items)
+                    $items | ProcessPolicies
+                }
+                if (Test-Path "$userPath\ExpectedMSIAppPackages") {
+                    [array]$items = Get-ChildItem "$userPath\ExpectedMSIAppPackages" 
+                    AddDisplay ([ref]$items)
+                    $items | ProcessApps -currentUser $userSid
+                }
+                if (Test-Path "$userPath\ExpectedModernAppPackages") {
+                    [array]$items = Get-ChildItem "$userPath\ExpectedModernAppPackages"
+                    AddDisplay ([ref]$items)
+                    $items | ProcessModernApps -currentUser $userSid
+                }
+                if (Test-Path "$userPath\Sidecar") {
+                    [array]$items = Get-ChildItem "$path\Sidecar" | ? { $_.Property -match "./User" }
+                    AddDisplay ([ref]$items)
+                    $items | ProcessSidecar -currentUser $userSid
+                }
+                if (Test-Path "$userPath\ExpectedSCEPCerts") {
+                    [array]$items = Get-ChildItem "$userPath\ExpectedSCEPCerts"
+                    AddDisplay ([ref]$items)
+                    $items | ProcessCerts
+                }
             }
         }
-        if (Test-Path "$path\ExpectedSCEPCerts") {
-            $items = Get-ChildItem "$path\ExpectedSCEPCerts"
-            if ($AllSessions) {
-                $items | ProcessCerts
-            }elseif ($items.Count -gt 0) {
-                $items[$items.Count - 1] | ProcessCerts
-            }
+        else {
+            Write-Host "ESP diagnostics info does not (yet) exist."
         }
 
-        # Process user ESP sessions
-        Get-ChildItem "$path" | ? { $_.PSChildName.StartsWith("S-") } | % {
-            $userPath = $_.PSPath
-            $userSid = $_.PSChildName
-            Write-Host " "
-            Write-Host "USER ESP for $($userSid):"
-            Write-Host " "
-            if (Test-Path "$userPath\ExpectedMSIAppPackages") {
-                $items = Get-ChildItem "$userPath\ExpectedMSIAppPackages" 
-                if ($AllSessions) {
-                    $items | ProcessApps -currentUser $userSid
-                }elseif ($items.Count -gt 0) {
-                    $items[$items.Count - 1] | ProcessApps -currentUser $userSid
+        # Display timeline
+        Write-Host ""
+        Write-Host "OBSERVED TIMELINE:" -ForegroundColor Magenta
+        Write-Host ""
+        $observedTimeline | Sort-Object -Property Date |
+            Format-Table @{
+                Label = "Date"
+                Expression = { $_.Date.ToString("u") } 
+            }, 
+            @{
+                Label = "Status"
+                Expression =
+                {
+                    switch ($_.Color)
+                    {
+                        'Red'    { $color = "91"; break }
+                        'Yellow' { $color = '93'; break }
+                        'Green'  { $color = "92"; break }
+                        default { $color = "0" }
+                    }
+                    $e = [char]27
+                    "$e[${color}m$($_.Status)$e[0m"
                 }
-            }
-            if (Test-Path "$userPath\ExpectedModernAppPackages") {
-                $items = Get-ChildItem "$userPath\ExpectedModernAppPackages"
-                if ($AllSessions) {
-                    $items | ProcessModernApps -currentUser $userSid
-                }elseif ($items.Count -gt 0) {
-                    $items[$items.Count - 1] | ProcessModernApps -currentUser $userSid
-                }
-            }
-            if (Test-Path "$userPath\Sidecar") {
-                $items = Get-ChildItem "$userPath\Sidecar"
-                if ($AllSessions) {
-                    $items | ProcessSidecar -currentUser $userSid
-                }elseif ($items.Count -gt 0) {
-                    $items[$items.Count - 1] | ProcessSidecar -currentUser $userSid
-                }
-            }
-            if (Test-Path "$userPath\ExpectedPolicies") {
-                $items = Get-ChildItem "$userPath\ExpectedPolicies"
-                if ($AllSessions) {
-                    $items | ProcessPolicies
-                }elseif ($items.Count -gt 0) {
-                    $items[$items.Count - 1] | ProcessPolicies
-                }
-            }
-            if (Test-Path "$userPath\ExpectedSCEPCerts") {
-                $items = Get-ChildItem "$userPath\ExpectedSCEPCerts"
-                if ($AllSessions) {
-                    $items | ProcessCerts
-                }elseif ($items.Count -gt 0) {
-                    $items[$items.Count - 1] | ProcessCerts
-                }
-            }
-        }
+            },
+            Detail
 
         Write-Host ""
     }
@@ -1426,8 +1872,7 @@ Function Get-AutopilotESPStatus(){
     End {
 
         # Remove the registry info if it exists
-        if (Test-Path "HKCU:\ESPStatus.tmp")
-        {
+        if (Test-Path "HKCU:\ESPStatus.tmp") {
             Remove-Item -Path "HKCU:\ESPStatus.tmp" -Recurse -Force
         }
     }
@@ -1935,7 +2380,7 @@ do {
                   
             
             AutopilotNuke }
-            3 { Get-AutopilotESPStatus -Online }
+            3 { Get-AutopilotDiagnostics -Online }
             4 { UpdateWindows }
             0 { Stop-Transcript;exit }
         }
