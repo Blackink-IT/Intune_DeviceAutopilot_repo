@@ -936,6 +936,7 @@ Function AutopilotNuke(){
 
     }
 }
+
 #Pulled from here: https://www.powershellgallery.com/packages/Get-AutopilotDiagnostics/5.6/Content/Get-AutopilotDiagnostics.ps1
 Function Get-AutopilotDiagnostics(){
     <#PSScriptInfo
@@ -1340,7 +1341,7 @@ Function Get-AutopilotDiagnostics(){
                     else {
                         if ($display) { Write-Host " Win32 $win32Key : $status ($($espStatus[$status.ToString()]))" -ForegroundColor Green }
                     }
-                    RecordStatus -detail "Win32 $win32Key" -status $espStatus[$status.ToString()] -color "Green" -date $currentKey.PSChildName
+                    #RecordStatus -detail "Win32 $win32Key" -status $espStatus[$status.ToString()] -color "Green" -date $currentKey.PSChildName
                 }
                 elseif ($status -eq "4") {
                     if ($exitCode -ne $null) {
@@ -2380,7 +2381,10 @@ do {
                   
             
             AutopilotNuke }
-            3 { Get-AutopilotDiagnostics -Online }
+            3 { try{
+                Get-AutopilotDiagnostics -Online 
+                }
+            }
             4 { UpdateWindows }
             0 { Stop-Transcript;exit }
         }
