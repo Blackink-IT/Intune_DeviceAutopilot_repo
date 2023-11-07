@@ -1341,7 +1341,7 @@ Function Get-AutopilotDiagnostics(){
                     else {
                         if ($display) { Write-Host " Win32 $win32Key : $status ($($espStatus[$status.ToString()]))" -ForegroundColor Green }
                     }
-                    #RecordStatus -detail "Win32 $win32Key" -status $espStatus[$status.ToString()] -color "Green" -date $currentKey.PSChildName
+                    #ecordStatus -detail "Win32 $win32Key" -status $espStatus[$status.ToString()] -color "Green" -date $currentKey.PSChildName
                 }
                 elseif ($status -eq "4") {
                     if ($exitCode -ne $null) {
