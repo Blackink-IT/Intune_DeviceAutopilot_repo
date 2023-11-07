@@ -2382,8 +2382,8 @@ do {
             
             AutopilotNuke }
             3 { try{
-                Get-AutopilotDiagnostics -Online 
-                }
+                    Get-AutopilotDiagnostics -Online 
+                }catch{}
             }
             4 { UpdateWindows }
             0 { Stop-Transcript;exit }
