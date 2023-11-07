@@ -2382,8 +2382,12 @@ do {
             
             AutopilotNuke }
             3 { try{
+                    Install-PackageProvider -Name NuGet -Force
                     Get-AutopilotDiagnostics -Online 
-                }catch{}
+                }catch{
+                    Write-Host "An error occurred:"
+                    Write-Host $_
+                }
             }
             4 { UpdateWindows }
             0 { Stop-Transcript;exit }
