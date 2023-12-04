@@ -340,7 +340,7 @@ Function Enroll-Device(){
         $DeviceObjectID = $(Get-AzureADDevice -SearchString $serial).ObjectID
         $GroupMembershipCheck = $(Get-AzureADGroupMember -ObjectId $QueryGroup.ObjectId -All $true)
         if(!($GroupMembershipCheck -contains $DeviceObjectID)){
-            Write-host "The Azure AD Group $($QueryGroup.DisplayName) did not contain the device $serial | Attemptiong to add it now. If it fails this will loop forever. To fix this login to the 365 and add the device to the group manually" -ForegroundColor Yellow
+            Write-host "The Azure AD Group $($QueryGroup.DisplayName) did not contain the device $serial | Attempting to add it now. If it fails this will loop forever. To fix this login to the 365 and add the device to the group manually" -ForegroundColor Yellow
             Add-AzureADGroupMember -ObjectId $QueryGroup.ObjectId -RefObjectId $DeviceObjectID 
         }
         $DeviceObjectID = $null
