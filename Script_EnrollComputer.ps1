@@ -150,7 +150,7 @@ Function Enroll-Device(){
     #Connect to Graph then AzureAD
     Write-Host "Please sign in to Azure AD and Graph to begin the device upload process" -ForegroundColor Yellow
     $aadId = Connect-AzureAD
-    Write-Host "Connected to Azure tenant $($aadId.TenantId.Guid)"
+    Write-Host "Connected to Azure tenant. Domain: $($aadId.tenantdomain) | Tenant ID: $($aadId.TenantId.Guid)"
     #Connect to MgGraph
     Write-Host "Connecting to MgGraph now (Microsoft Graph Command Line Tools)"
     Write-Host "NOTE: If you have to consent to anything with the MgGraph connection you will need a global admin. Talk to the infra team for help <3"
@@ -275,6 +275,34 @@ Function Enroll-Device(){
     " -ForegroundColor Yellow
     if($null -ne $UPN){
         while(($addressableUserName -eq "") -and ($userPrincipalName -eq "")){
+            #Connect to AzureAD if it's not connected already if we end up doing the user query
+            Try{
+                $AzureADConnectionTest = Get-AzureADDomain -Name $($aadId.tenantdomain)
+                if($AzureADConnectionTest.Name -ne $($aadId.tenantdomain)){
+                    # Write-Host "Looks like you're already connected to Azure AD" -foregroundcolor green
+                }Else{
+                    $AzureADConnection = Connect-AzureAD -AccountId $Username| Out-Null
+                    $AzureADConnectionTest = Get-AzureADDomain -Name $($aadId.tenantdomain)
+                }
+
+            }
+            Catch{
+                while($AzureADConnectionTest.Name -ne $($aadId.tenantdomain)){
+                    Write-Host "Connecting to Azure AD now" -foregroundcolor yellow
+                    $AzureADConnection = Connect-AzureAD -AccountId $Username | Out-Null
+                    $AzureADConnectionTest = Get-AzureADDomain -Name $($aadId.tenantdomain)
+                }
+            }
+            #Ensure device is in group
+            $DeviceObjectID = $(Get-AzureADDevice -SearchString $serial).ObjectID
+            $GroupMembershipCheck = $(Get-AzureADGroupMember -ObjectId $QueryGroup.ObjectId -All $true)
+            if(!($GroupMembershipCheck -contains $DeviceObjectID)){
+                Write-host "The Azure AD Group $($QueryGroup.DisplayName) did not contain the device $serial | Attemptiong to add it now. If it fails this will loop forever. To fix this login to the 365 and add the device to the group manually" -ForegroundColor Yellow
+                Add-AzureADGroupMember -ObjectId $QueryGroup.ObjectId -RefObjectId $DeviceObjectID 
+            }
+            $DeviceObjectID = $null
+            $GroupMembershipCheck = $null
+
             Set-AutopilotDevice -userPrincipalName $UPN -Id $id -addressableUserName $QueryDisplayName -displayName $ComputerName
             Start-Sleep -Seconds 5
             $device = Get-AutopilotDevice -serial $serial
@@ -290,6 +318,34 @@ Function Enroll-Device(){
         }
 
     While($displayName -eq ""){
+        #Connect to AzureAD if it's not connected already if we end up doing the user query
+        Try{
+            $AzureADConnectionTest = Get-AzureADDomain -Name $($aadId.tenantdomain)
+            if($AzureADConnectionTest.Name -ne $($aadId.tenantdomain)){
+                # Write-Host "Looks like you're already connected to Azure AD" -foregroundcolor green
+            }Else{
+                $AzureADConnection = Connect-AzureAD -AccountId $Username| Out-Null
+                $AzureADConnectionTest = Get-AzureADDomain -Name $($aadId.tenantdomain)
+            }
+
+        }
+        Catch{
+            while($AzureADConnectionTest.Name -ne $($aadId.tenantdomain)){
+                Write-Host "Connecting to Azure AD now" -foregroundcolor yellow
+                $AzureADConnection = Connect-AzureAD -AccountId $Username | Out-Null
+                $AzureADConnectionTest = Get-AzureADDomain -Name $($aadId.tenantdomain)
+            }
+        }
+        #Ensure device is in group
+        $DeviceObjectID = $(Get-AzureADDevice -SearchString $serial).ObjectID
+        $GroupMembershipCheck = $(Get-AzureADGroupMember -ObjectId $QueryGroup.ObjectId -All $true)
+        if(!($GroupMembershipCheck -contains $DeviceObjectID)){
+            Write-host "The Azure AD Group $($QueryGroup.DisplayName) did not contain the device $serial | Attemptiong to add it now. If it fails this will loop forever. To fix this login to the 365 and add the device to the group manually" -ForegroundColor Yellow
+            Add-AzureADGroupMember -ObjectId $QueryGroup.ObjectId -RefObjectId $DeviceObjectID 
+        }
+        $DeviceObjectID = $null
+        $GroupMembershipCheck = $null
+
         Set-AutopilotDevice -Id $id -displayName $ComputerName
         Start-Sleep -Seconds 5
         $device = Get-AutopilotDevice -serial $serial
