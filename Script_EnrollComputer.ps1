@@ -1408,7 +1408,7 @@ do {
 
         Write-Host "-----
         Please make a selection for action" -f Cyan 
-        
+
         $userAction = Read-Host "
 [1] Add Device to Intune
 [2] REMOVE Device from Autopilot, Intune, and Azure | Use this if a deployment fails before just trying again
@@ -1420,34 +1420,34 @@ do {
 "
         switch ($userAction) {
             1 { Enroll-Device}
-            2 { 
-            
+            2 {
+
             # Identify all the Bitlocker volumes.
             $BitlockerVolumers = Get-BitLockerVolume
 
             # For each volume, get the RecoveryPassowrd and display it.
             $BitlockerVolumers |
             ForEach-Object {
-                $MountPoint = $_.MountPoint 
-                $RecoveryKey = [string]($_.KeyProtector).RecoveryPassword       
+                $MountPoint = $_.MountPoint
+                $RecoveryKey = [string]($_.KeyProtector).RecoveryPassword
                 if ($RecoveryKey.Length -gt 5) {
                     Write-Output ("The drive $MountPoint has a recovery key $RecoveryKey.")
-                    }        
+                    }
                 }
                 if ($null -ne $RecoveryKey) {
                     Write-Host "A Recovery Key was found. Please save the Recovery Key to a USB before proceeding.
                     $RecoveryKey" -ForegroundColor Yellow
-                    While ($RecoveryKey_Exists -ne "Yes") {                      
+                    While ($RecoveryKey_Exists -ne "Yes") {
                         $RecoveryKey_Exists = Read-Host "Please type Yes once the Recovery Key has been saved." }
 
                         }
-                  
-            
+
+
             AutopilotNuke }
             3 { try{
-                    $AutoPilotDiagnostics  = Get-InstalledScript -Name Get-AutoPilotDiagnostics -ErrorAction Ignore
+                    $AutoPilotDiagnostics  = Get-InstalledScript -Name Get-AutopilotDiagnosticsCommunity -ErrorAction Ignore
                     if(!($AutoPilotDiagnostics)){
-                        Install-Script -Name Get-AutopilotDiagnostics -Force
+                        Install-Script -Name Get-AutopilotDiagnosticsCommunity -Force
                     }
                     # Get NuGet
                     $provider = Get-PackageProvider NuGet -ErrorAction Ignore
