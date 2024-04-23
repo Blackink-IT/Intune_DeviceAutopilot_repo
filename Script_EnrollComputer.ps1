@@ -236,13 +236,23 @@ Function Enroll-Device(){
     #endregion
 
     #Check for valid group
-    $QueryGroup = Get-AzureADGroup | Where-Object{$_.displayName -like "*$GroupName*"}
+    $QueryGroup = Get-AzureADGroup -All:$true | Where-Object{$_.displayName -like "*$GroupName*"}
     while($null -eq $QueryGroup){
-        $GroupName = Read-Host 'It does not look like the Group provided matches anything in Azure. Group name we looked for '$GroupName' Please enter another group name'
-        while(($GroupName -eq "") -or ($null -eq $GroupName)){
-            $GroupName = Read-Host 'It does not look like the Group provided matches anything in Azure. Please enter another group name'}
-            $QueryGroup = Get-AzureADGroup | Where-Object{$_.displayName -like "*$GroupName*"}
+        $QueryGroup = Get-AzureADGroup -All:$true | Select-Object DisplayName,Description,ObjectID
+        if($QueryGroup.DisplayName -notcontains "Enroll_AutoPilot_v1"){
+            $QueryGroup += New-Object psobject -Property @{
+                DisplayName = "Enroll_AutoPilot_v1"
+                Description = "This group is for all devices that have been deployed using this Autopilot profile 'Enroll_AutoPilot_v1' as well as any 'Generic Installers'. Devices deployed through BIIT's script are placed in this group."
+                ObjectID = $null
+            }
+            Write-Host "The AutoPilot profile 'Enroll_AutoPilot_v1' may not exist because the group Intune_Devices_AutopilotDeployed does not yet exist" -ForegroundColor Red
+            Write-Host "Please talk to infrastructure about ensuring the autopilot profile exists in Intune for this client" -ForegroundColor Red
         }
+        $QueryGroup = $QueryGroup | Select-Object DisplayName,Description,ObjectId | Sort-Object DisplayName | Out-GridView -PassThru -Title "Please select which group you would like to put the device in"
+        if(($null -eq $QueryGroup.ObjectID) -and ($null -ne $QueryGroup)){
+            New-AzureADGroup -DisplayName $QueryGroup.DisplayName -MailEnabled $false -SecurityEnabled $true -MailNickName "NotSet" -Description $QueryGroup.Description
+        }
+    }
 
     #To save time start checking for windows updates
     $SilentWindowsUpdateBlock = {Import-Module -Name PSWindowsUpdate -Force
