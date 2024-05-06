@@ -156,7 +156,7 @@ Function Enroll-Device(){
     Write-Host "NOTE: If you have to consent to anything with the MgGraph connection you will need a global admin. Talk to the infra team for help <3"
     $MgGraph = Connect-MgGraph -TenantID $($aadId.TenantId.Guid) -Scope DeviceManagementServiceConfig.ReadWrite.All
     #Write-Host "Attempting to connect to MSGraph now."
-    $graph = Connect-MSGraph
+    # $graph = Connect-MSGraph
 
     #Username of person that needs to be assigned
     while(($StandardDeployment -eq "") -or ($null -eq $StandardDeployment) -or ("yes","no" -notcontains $StandardDeployment)){
@@ -2030,12 +2030,14 @@ Function Get-WindowsAutoPilotInfo(){
             # Connect
             if ($AppId -ne "")
             {
-                $graph = Connect-MSGraphApp -Tenant $TenantId -AppId $AppId -AppSecret $AppSecret
-                Write-Host "Connected to Intune tenant $TenantId using app-based authentication (Azure AD authentication not supported)"
+                # $graph = Connect-MSGraphApp -Tenant $TenantId -AppId $AppId -AppSecret $AppSecret
+                # Write-Host "Connected to Intune tenant $TenantId using app-based authentication (Azure AD authentication not supported)"
+                Write-Host "Hit need to conenct to MSGraph but this is currently commented out"
             }
             else {
-                $graph = Connect-MSGraph
-                Write-Host "Connected to Intune tenant $($graph.TenantId)"
+                # $graph = Connect-MSGraph
+                # Write-Host "Connected to Intune tenant $($graph.TenantId)"
+                Write-Host "Hit need to conenct to MSGraph but this is currently commented out"
                 if ($AddToGroup)
                 {
                     $aadId = Connect-AzureAD
