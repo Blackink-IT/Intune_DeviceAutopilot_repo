@@ -188,7 +188,7 @@ Function Enroll-Device(){
             $QueryDisplayName = $QueryUser.DisplayName
             Write-Host "User Confirmed. Looks like $QueryDisplayName is getting a new computer." -ForegroundColor green
             #Set needed group for query
-            # $GroupAssignment = "Intune_Devices_AutopilotDeployed"
+            #$GroupAssignment = "Intune_Devices_AutopilotDeployed"
         }
 
 
@@ -265,31 +265,31 @@ Function Enroll-Device(){
         #Get Serial Number
         $serial = (Get-WmiObject -class win32_bios).SerialNumber  
 
-        #Kick off device upload process
-        if(($null -eq $UPN) -or ($UPN -eq "")){
-            Get-WindowsAutoPilotInfo -Online -AddToGroup $GroupName -AssignedComputerName $ComputerName
-        }else{
-            Get-WindowsAutoPilotInfo -Online -AddToGroup $GroupName -AssignedUser $UPN -AssignedComputerName $ComputerName
-        }
-        $QueryGroup = Get-AzureADGroup -All:$true | Where-Object{$_.displayName -like "*$GroupName*"}
-        Write-Host "        
-        Veryifying '$serial' is added to the group '$($QueryGroup.displayName)'"
-        while($(Get-AzureADGroupMember -ObjectId $QueryGroup.ObjectID -All $true | Select-Object DisplayName).DisplayName -notcontains $serial){
-            Write-Host "
-    Group '$GroupName' does not contain '$serial'" -ForegroundColor Yellow
-            Write-Host "
-    The script will attempt to add the device to the noted group and will wait for 5 seconds after attempting to add it" -ForegroundColor Yellow
-            Write-Host "    NOTE: The script will be stuck in this loop until it sees the device added to the needed group. If it is stuck either add it to the noted group manually or restart the script" -ForegroundColor Yellow
-            $DeviceQuery = Get-AzureADDevice -SearchString $serial
-            foreach($Device in $DeviceQuery){
-                Add-AzureADGroupMember -ObjectId $QueryGroup.ObjectID -RefObjectId $Device.ObjectID
+    #     #Kick off device upload process
+    #     if(($null -eq $UPN) -or ($UPN -eq "")){
+    #         Get-WindowsAutoPilotInfo -Online -AddToGroup $GroupName -AssignedComputerName $ComputerName
+    #     }else{
+    #         Get-WindowsAutoPilotInfo -Online -AddToGroup $GroupName -AssignedUser $UPN -AssignedComputerName $ComputerName
+    #     }
+    #     $QueryGroup = Get-AzureADGroup -All:$true | Where-Object{$_.displayName -like "*$GroupName*"}
+    #     Write-Host "        
+    #     Veryifying '$serial' is added to the group '$($QueryGroup.displayName)'"
+    #     while($(Get-AzureADGroupMember -ObjectId $QueryGroup.ObjectID -All $true | Select-Object DisplayName).DisplayName -notcontains $serial){
+    #         Write-Host "
+    # Group '$GroupName' does not contain '$serial'" -ForegroundColor Yellow
+    #         Write-Host "
+    # The script will attempt to add the device to the noted group and will wait for 5 seconds after attempting to add it" -ForegroundColor Yellow
+    #         Write-Host "    NOTE: The script will be stuck in this loop until it sees the device added to the needed group. If it is stuck either add it to the noted group manually or restart the script" -ForegroundColor Yellow
+    #         $DeviceQuery = Get-AzureADDevice -SearchString $serial
+    #         foreach($Device in $DeviceQuery){
+    #             Add-AzureADGroupMember -ObjectId $QueryGroup.ObjectID -RefObjectId $Device.ObjectID
                 
-            }
-            Start-Sleep -Seconds 5
-        }
-        Write-Host "
+    #         }
+    #         Start-Sleep -Seconds 5
+    #     }
+    #     Write-Host "
         
-        '$serial' is added to the group '$GroupName' moving on with the script. We'll now wait on the autopilot profile to be asigned" -ForegroundColor Green
+    #     '$serial' is added to the group '$GroupName' moving on with the script. We'll now wait on the autopilot profile to be asigned" -ForegroundColor Green
 
         #Kick off device upload process
         if(($null -eq $UPN) -or ($UPN -eq "")){
