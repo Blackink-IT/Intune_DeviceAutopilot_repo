@@ -263,8 +263,7 @@ Function Enroll-Device(){
         $JobStart = Start-Job -ScriptBlock $SilentWindowsUpdateBlock
 
         #Get Serial Number
-        $session = New-CimSession
-        $serial = (Get-CimInstance -CimSession $session -Class Win32_BIOS).SerialNumber
+        $serial = (Get-WmiObject -class win32_bios).SerialNumber  
 
         #Kick off device upload process
         if(($null -eq $UPN) -or ($UPN -eq "")){
