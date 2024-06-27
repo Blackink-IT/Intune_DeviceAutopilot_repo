@@ -188,7 +188,7 @@ Function Enroll-Device(){
             $QueryDisplayName = $QueryUser.DisplayName
             Write-Host "User Confirmed. Looks like $QueryDisplayName is getting a new computer." -ForegroundColor green
             #Set needed group for query
-            $GroupAssignment = "Intune_Devices_AutopilotDeployed"
+            # $GroupAssignment = "Intune_Devices_AutopilotDeployed"
         }
 
 
@@ -233,7 +233,7 @@ Function Enroll-Device(){
         }
 
         #Azure group name and Autopilot GroupTag
-        $GroupName = $GroupAssignment
+        $GroupName = "Intune_Devices_AutopilotDeployed"
         #endregion
 
         #Check for valid group
