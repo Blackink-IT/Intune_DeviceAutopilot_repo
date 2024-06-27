@@ -267,9 +267,9 @@ Function Enroll-Device(){
 
         #Kick off device upload process
         if(($null -eq $UPN) -or ($UPN -eq "")){
-            Get-WindowsAutoPilotInfo -Online $false -AddToGroup $GroupName -Assign -AssignedComputerName $ComputerName
+            Get-WindowsAutoPilotInfo -Online -AddToGroup $GroupName -AssignedComputerName $ComputerName
         }else{
-            Get-WindowsAutoPilotInfo -Online $false -AddToGroup $GroupName -Assign -AssignedUser $UPN -AssignedComputerName $ComputerName
+            Get-WindowsAutoPilotInfo -Online -AddToGroup $GroupName -AssignedUser $UPN -AssignedComputerName $ComputerName
         }
         Write-Host "        
         Veryifying '$serial' is added to the group '$GroupName'"
@@ -2066,14 +2066,14 @@ Function Get-WindowsAutoPilotInfo(){
             # Connect
             if ($AppId -ne "")
             {
-                $graph = Connect-MSGraphApp -Tenant $TenantId -AppId $AppId -AppSecret $AppSecret
-                Write-Host "Connected to Intune tenant $TenantId using app-based authentication (Azure AD authentication not supported)"
-                # Write-Host "Hit need to conenct to MSGraph but this is currently commented out"
+                # $graph = Connect-MSGraphApp -Tenant $TenantId -AppId $AppId -AppSecret $AppSecret
+                # Write-Host "Connected to Intune tenant $TenantId using app-based authentication (Azure AD authentication not supported)"
+                Write-Host "Hit need to conenct to MSGraph but this is currently commented out"
             }
             else {
-                $graph = Connect-MSGraph
-                Write-Host "Connected to Intune tenant $($graph.TenantId)"
-                # Write-Host "Hit need to conenct to MSGraph but this is currently commented out"
+                # $graph = Connect-MSGraph
+                # Write-Host "Connected to Intune tenant $($graph.TenantId)"
+                Write-Host "Hit need to conenct to MSGraph but this is currently commented out"
                 if ($AddToGroup)
                 {
                     $aadId = Connect-AzureAD
