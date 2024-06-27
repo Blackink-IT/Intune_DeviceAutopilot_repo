@@ -2066,13 +2066,13 @@ Function Get-WindowsAutoPilotInfo(){
             # Connect
             if ($AppId -ne "")
             {
-                # $graph = Connect-MSGraphApp -Tenant $TenantId -AppId $AppId -AppSecret $AppSecret
-                # Write-Host "Connected to Intune tenant $TenantId using app-based authentication (Azure AD authentication not supported)"
+                $graph = Connect-MSGraphApp -Tenant $TenantId -AppId $AppId -AppSecret $AppSecret
+                Write-Host "Connected to Intune tenant $TenantId using app-based authentication (Azure AD authentication not supported)"
                 Write-Host "Hit need to conenct to MSGraph but this is currently commented out"
             }
             else {
-                # $graph = Connect-MSGraph
-                # Write-Host "Connected to Intune tenant $($graph.TenantId)"
+                $graph = Connect-MSGraph
+                Write-Host "Connected to Intune tenant $($graph.TenantId)"
                 Write-Host "Hit need to conenct to MSGraph but this is currently commented out"
                 if ($AddToGroup)
                 {
