@@ -266,30 +266,30 @@ Function Enroll-Device(){
         $session = New-CimSession
         $serial = (Get-CimInstance -CimSession $session -Class Win32_BIOS).SerialNumber
 
-    #     #Kick off device upload process
-    #     if(($null -eq $UPN) -or ($UPN -eq "")){
-    #         Get-WindowsAutoPilotInfo -AddToGroup $GroupName -Assign -AssignedComputerName $ComputerName
-    #     }else{
-    #         Get-WindowsAutoPilotInfo -AddToGroup $GroupName -Assign -AssignedUser $UPN -AssignedComputerName $ComputerName
-    #     }
-    #     Write-Host "        
-    #     Veryifying '$serial' is added to the group '$GroupName'"
-    #     while($(Get-AzureADGroupMember -ObjectId $QueryGroup.ObjectID -All $true | Select-Object DisplayName).DisplayName -notcontains $serial){
-    #         Write-Host "
-    # Group '$GroupName' does not contain '$serial'" -ForegroundColor Yellow
-    #         Write-Host "
-    # The script will attempt to add the device to the noted group and will wait for 5 seconds after attempting to add it" -ForegroundColor Yellow
-    #         Write-Host "    NOTE: The script will be stuck in this loop until it sees the device added to the needed group. If it is stuck either add it to the noted group manually or restart the script" -ForegroundColor Yellow
-    #         $DeviceQuery = Get-AzureADDevice -SearchString $serial
-    #         foreach($Device in $DeviceQuery){
-    #             Add-AzureADGroupMember -ObjectId $QueryGroup.ObjectID -RefObjectId $Device.ObjectID
+        #Kick off device upload process
+        if(($null -eq $UPN) -or ($UPN -eq "")){
+            Get-WindowsAutoPilotInfo -AddToGroup $GroupName -Assign -AssignedComputerName $ComputerName
+        }else{
+            Get-WindowsAutoPilotInfo -AddToGroup $GroupName -Assign -AssignedUser $UPN -AssignedComputerName $ComputerName
+        }
+        Write-Host "        
+        Veryifying '$serial' is added to the group '$GroupName'"
+        while($(Get-AzureADGroupMember -ObjectId $QueryGroup.ObjectID -All $true | Select-Object DisplayName).DisplayName -notcontains $serial){
+            Write-Host "
+    Group '$GroupName' does not contain '$serial'" -ForegroundColor Yellow
+            Write-Host "
+    The script will attempt to add the device to the noted group and will wait for 5 seconds after attempting to add it" -ForegroundColor Yellow
+            Write-Host "    NOTE: The script will be stuck in this loop until it sees the device added to the needed group. If it is stuck either add it to the noted group manually or restart the script" -ForegroundColor Yellow
+            $DeviceQuery = Get-AzureADDevice -SearchString $serial
+            foreach($Device in $DeviceQuery){
+                Add-AzureADGroupMember -ObjectId $QueryGroup.ObjectID -RefObjectId $Device.ObjectID
                 
-    #         }
-    #         Start-Sleep -Seconds 5
-    #     }
-    #     Write-Host "
+            }
+            Start-Sleep -Seconds 5
+        }
+        Write-Host "
         
-    #     '$serial' is added to the group '$GroupName' moving on with the script. We'll now wait on the autopilot profile to be asigned" -ForegroundColor Green
+        '$serial' is added to the group '$GroupName' moving on with the script. We'll now wait on the autopilot profile to be asigned" -ForegroundColor Green
 
         #Kick off device upload process
         if(($null -eq $UPN) -or ($UPN -eq "")){
@@ -1896,11 +1896,12 @@ function Get-AutopilotDiagnostics{
 #EndRegion - Functions
 
 #Region - Get-WindowsAutoPilotInfo
-#Originally from PS Gallery: https://www.powershellgallery.com/packages/Get-WindowsAutoPilotInfo/3.8/Content/Get-WindowsAutopilotInfo.ps1
+#Originally from PS Gallery: https://www.powershellgallery.com/packages/Get-WindowsAutoPilotInfo/3.5/Content/Get-WindowsAutoPilotInfo.ps1
+#Was taken from here as the Connect-AzureAD function broke for a period of time - AT 5/24/2023
 Function Get-WindowsAutoPilotInfo(){
     <#PSScriptInfo
     
-    .VERSION 3.8
+    .VERSION 3.5
     
     .GUID ebf446a3-3362-4774-83c0-b7299410b63f
     
@@ -2009,8 +2010,7 @@ Function Get-WindowsAutoPilotInfo(){
     .\GetWindowsAutoPilotInfo.ps1 -Online
     
     #>
-
-    [CmdletBinding(DefaultParameterSetName = 'Default')]
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory=$False,ValueFromPipeline=$True,ValueFromPipelineByPropertyName=$True,Position=0)][alias("DNSHostName","ComputerName","Computer")] [String[]] $Name = @("localhost"),
         [Parameter(Mandatory=$False)] [String] $OutputFile = "", 
@@ -2067,16 +2067,18 @@ Function Get-WindowsAutoPilotInfo(){
             # Connect
             if ($AppId -ne "")
             {
-                $graph = Connect-MSGraphApp -Tenant $TenantId -AppId $AppId -AppSecret $AppSecret
-                Write-Host "Connected to Intune tenant $TenantId using app-based authentication (Azure AD authentication not supported)"
+                # $graph = Connect-MSGraphApp -Tenant $TenantId -AppId $AppId -AppSecret $AppSecret
+                # Write-Host "Connected to Intune tenant $TenantId using app-based authentication (Azure AD authentication not supported)"
+                Write-Host "Hit need to conenct to MSGraph but this is currently commented out"
             }
             else {
-                $graph = Connect-MSGraph
-                Write-Host "Connected to Intune tenant $($graph.TenantId)"
+                # $graph = Connect-MSGraph
+                # Write-Host "Connected to Intune tenant $($graph.TenantId)"
+                Write-Host "Hit need to conenct to MSGraph but this is currently commented out"
                 if ($AddToGroup)
                 {
-                    $aadId = Connect-AzureAD -AccountId $graph.UPN
-                    Write-Host "Connected to Azure AD tenant $($aadId.TenantId)"
+                    $aadId = Connect-AzureAD
+                    Write-Host "Connected to Azure AD tenant $($aadId.TenantId.GUID)"
                 }
             }
 
@@ -2228,7 +2230,11 @@ Function Get-WindowsAutoPilotInfo(){
             $importStart = Get-Date
             $imported = @()
             $computers | % {
-                $imported += Add-AutopilotImportedDevice -serialNumber $_.'Device Serial Number' -hardwareIdentifier $_.'Hardware Hash' -groupTag $_.'Group Tag' -assignedUser $_.'Assigned User'
+                # Write-Host "-SerialNumber $($_.'Device Serial Number')"
+                # Write-Host "-hardwareIdentifier $($_.'Hardware Hash')"
+                # Write-Host "-groupTag $($_.'Group Tag')"
+                # Write-Host "-assignedUser $($_.'Assigned User')"
+                $imported += Add-AutopilotImportedDevice -serialNumber $_.'Device Serial Number' -hardwareIdentifier $_.'Hardware Hash' -assignedUser $_.'Assigned User'
             }
 
             # Wait until the devices have been imported
