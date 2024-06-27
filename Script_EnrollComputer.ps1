@@ -268,9 +268,9 @@ Function Enroll-Device(){
 
         #Kick off device upload process
         if(($null -eq $UPN) -or ($UPN -eq "")){
-            Get-WindowsAutoPilotInfo -AddToGroup $GroupName -Assign -AssignedComputerName $ComputerName
+            Get-WindowsAutoPilotInfo -Online $false -AddToGroup $GroupName -Assign -AssignedComputerName $ComputerName
         }else{
-            Get-WindowsAutoPilotInfo -AddToGroup $GroupName -Assign -AssignedUser $UPN -AssignedComputerName $ComputerName
+            Get-WindowsAutoPilotInfo -Online $false -AddToGroup $GroupName -Assign -AssignedUser $UPN -AssignedComputerName $ComputerName
         }
         Write-Host "        
         Veryifying '$serial' is added to the group '$GroupName'"
