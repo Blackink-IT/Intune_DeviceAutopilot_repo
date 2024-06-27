@@ -271,8 +271,9 @@ Function Enroll-Device(){
         }else{
             Get-WindowsAutoPilotInfo -Online -AddToGroup $GroupName -AssignedUser $UPN -AssignedComputerName $ComputerName
         }
+        $QueryGroup = Get-AzureADGroup -All:$true | Where-Object{$_.displayName -like "*$GroupName*"}
         Write-Host "        
-        Veryifying '$serial' is added to the group '$GroupName'"
+        Veryifying '$serial' is added to the group '$($QueryGroup.displayName)'"
         while($(Get-AzureADGroupMember -ObjectId $QueryGroup.ObjectID -All $true | Select-Object DisplayName).DisplayName -notcontains $serial){
             Write-Host "
     Group '$GroupName' does not contain '$serial'" -ForegroundColor Yellow
