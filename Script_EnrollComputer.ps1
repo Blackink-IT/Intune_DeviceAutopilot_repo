@@ -431,10 +431,9 @@ Function Enroll-Device(){
         Checking for updates. If there are any available they will be installed.
         If a reboot is needed for an update it will be initiated." -ForegroundColor Magenta
         Write-Host "
-    Updates will now be installed if there are some remaining.
-        If you are in a rush and need updates to not install simply hit Ctrl + c to end the script."
+    Installing windows updates at this section removed. If you desire to update windows please use option 4" -foregroundcolor yellow
         $StopJob = Get-Job | Stop-Job
-        UpdateWindows -InstallUpdates "Yes"
+        #UpdateWindows -InstallUpdates "Yes"
         Stop-Transcript
     }catch{
         # Handle the exception
