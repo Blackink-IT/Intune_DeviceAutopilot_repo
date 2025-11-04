@@ -135,10 +135,11 @@ Function Enroll-Device(){
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
         #Region - Install Modules and scripts
-        Check-PowerShellModule -ModuleName AzureAD
+        Check-PowerShellModule -ModuleName Microsoft.Graph.Users
+        Check-PowerShellModule -ModuleName Microsoft.Graph.Groups
+        Check-PowerShellModule -ModuleName Microsoft.Graph.Identity.DirectoryManagement
         Check-PowerShellModule -ModuleName NuGet
         Check-PowerShellModule -ModuleName WindowsAutoPilotIntune
-        #Check-PowerShellModule -ModuleName Microsoft.Graph
         Check-PowerShellModule -ModuleName Microsoft.Graph.Intune
         
         #WindowsAutoPilotIntune: https://www.powershellgallery.com/packages/WindowsAutoPilotIntune/5.0
@@ -146,49 +147,42 @@ Function Enroll-Device(){
         #Region Get and assign variables
         Write-Host("
 
-        Pleaes provide the needed data to upload the device info to the clients Intune portal. If you get an error about incorrect sign in info YOU  info wrong.") -ForegroundColor Yellow
+        Please provide the needed data to upload the device info to the clients Intune portal. If you get an error about incorrect sign in info YOU entered info wrong.") -ForegroundColor Yellow
 
-        #Connect to Graph then AzureAD
-        Write-Host "Please sign in to Azure AD and Graph to begin the device upload process" -ForegroundColor Yellow
-        $aadId = Connect-AzureAD
-        Write-Host "Connected to Azure tenant. Domain: $($aadId.tenantdomain) | Tenant ID: $($aadId.TenantId.Guid)"
-        #Connect to MgGraph
-        Write-Host "Connecting to MgGraph now (Microsoft Graph Command Line Tools)"
-        Write-Host "NOTE: If you have to consent to anything with the MgGraph connection you will need a global admin. Talk to the infra team for help <3"
-        $MgGraph = Connect-MgGraph -TenantID $($aadId.TenantId.Guid) -Scope DeviceManagementServiceConfig.ReadWrite.All
-        #Write-Host "Attempting to connect to MSGraph now."
-        # $graph = Connect-MSGraph
+        #Connect to Microsoft Graph
+        Write-Host "Please sign in to Microsoft Graph to begin the device upload process" -ForegroundColor Yellow
+        Connect-MgGraph -Scopes "User.Read.All", "DeviceManagementServiceConfig.ReadWrite.All", "Group.ReadWrite.All", "Device.ReadWrite.All", "DeviceManagementManagedDevices.ReadWrite.All"
+        $context = Get-MgContext
+        Write-Host "Connected to tenant: $($context.TenantId)"
 
         #Username of person that needs to be assigned
         while(($StandardDeployment -eq "") -or ($null -eq $StandardDeployment) -or ("yes","no" -notcontains $StandardDeployment)){
-        $StandardDeployment = Read-host 'Is this PC going to be used as a SPARE or does it need a different Autopiloit enrollment profile/status page (Please enter "yes" or "no")?'}
+        $StandardDeployment = Read-host 'Is this PC going to be used as a SPARE or does it need a different Autopilot enrollment profile/status page (Please enter "yes" or "no")?'}
 
         if($StandardDeployment -eq 'No'){
-            while(($UPN -eq "") -or ($null -eq $UPN)){
-            $UPN = Read-Host '
-        What is the users Email/Username (userPrincipalName)'}
-            #Make sure a full email was entered
-            While ($UPN -notlike '*@*'){
-            Write-Host "
-            It does NOT look like you entered a valid email address. Please make sure you enter their full email addrss including the @ symbol and domain" -foregroundcolor red
-            $UPN = Read-Host 'What is the users Email/Username (userPrincipalName)'
+            # Get all enabled users and display in Out-GridView for selection
+            Write-Host "Loading all enabled users from Azure AD. Please wait..." -ForegroundColor Yellow
+            
+            $AllUsers = Get-MgUser -Filter "accountEnabled eq true" -All | 
+                        Select-Object DisplayName, UserPrincipalName, Mail, Department, JobTitle | 
+                        Sort-Object DisplayName
+            
+            Write-Host "Please select the user from the grid view..." -ForegroundColor Cyan
+            
+            $SelectedUser = $AllUsers | Out-GridView -Title "Select the user for this device" -PassThru
+            
+            if($null -eq $SelectedUser){
+                Write-Host "No user was selected. Please try again." -ForegroundColor Red
+                while($null -eq $SelectedUser){
+                    $SelectedUser = $AllUsers | Out-GridView -Title "Select the user for this device (REQUIRED)" -PassThru
+                }
             }
-            #Connect to Graph and Azure to test username
-            $QueryUser = Get-AzureADUser -Filter "userPrincipalName eq '$UPN'"
-            $UPNId = $QueryUser.ObjectId
-            While ($null -eq $UPNId){
-                Write-Host "It does look like the username you entered ($UPN) was not correct. We could not find a matching user in Azure AD. Please retry" -ForegroundColor Red
-                $UPN = $null
-                while(($UPN -eq "") -or ($null -eq $UPN)){
-                    $UPN = Read-Host 'We could not find the user in Azure. What is the users Email/Username (userPrincipalName)'}
-            $QueryUser = Get-AzureADUser -Filter "userPrincipalName eq '$UPN'"
-            $UPNId = $QueryUser.ObjectId
-            }
-            #Get DisplayName info
-            $QueryDisplayName = $QueryUser.DisplayName
-            Write-Host "User Confirmed. Looks like $QueryDisplayName is getting a new computer." -ForegroundColor green
-            #Set needed group for query
-            #$GroupAssignment = "Intune_Devices_AutopilotDeployed"
+            
+            $UPN = $SelectedUser.UserPrincipalName
+            $QueryDisplayName = $SelectedUser.DisplayName
+            $UPNId = (Get-MgUser -Filter "userPrincipalName eq '$UPN'").Id
+            
+            Write-Host "User Confirmed. Looks like $QueryDisplayName ($UPN) is getting a new computer." -ForegroundColor green
         }
 
 
@@ -198,10 +192,10 @@ Function Enroll-Device(){
             Write-Host "Checking to see if that device name is already taken..."
             While ($ComputerName.length -gt 15) {
                 Write-Host "
-            Please enter 15 or less than characters for the computer name. Windoes does not allow more than 15 characters." -foregroundcolor red
+            Please enter 15 or less than characters for the computer name. Windows does not allow more than 15 characters." -foregroundcolor red
                 $ComputerName = Read-Host 'What would you like to name this device? (NOTE name applies after white glove is completed)'
             }
-            #Check computer name in Autppilot devices
+            #Check computer name in Autopilot devices
             $AllDevices = Get-AutopilotDevice
             ForEach($Device in $AllDevices){
                 if($ComputerName -eq $Device.displayName){
@@ -209,9 +203,9 @@ Function Enroll-Device(){
                     $ComputerName = $Null
                 }
             }
-            #Check computer name in AzureAD
+            #Check computer name in Azure AD (now using Microsoft Graph)
             if($null -ne $ComputerName){
-                $AllDevices = Get-AzureADDevice -All $True
+                $AllDevices = Get-MgDevice -All
                 foreach($Device in $AllDevices){
                     if($ComputerName -eq $Device.displayName){     
                         Write-Host "It looks like this device name ($ComputerName) was already taken by a device in Azure. Please try again." -foregroundcolor red
@@ -236,22 +230,29 @@ Function Enroll-Device(){
         $GroupName = "Intune_Devices_AutopilotDeployed"
         #endregion
 
-        #Check for valid group
-        $QueryGroup = Get-AzureADGroup -All:$true | Where-Object{$_.displayName -like "*$GroupName*"}
+        #Check for valid group (using Microsoft Graph)
+        $QueryGroup = Get-MgGroup -All | Where-Object{$_.displayName -like "*$GroupName*"}
         while($null -eq $QueryGroup){
-            $QueryGroup = Get-AzureADGroup -All:$true | Select-Object DisplayName,Description,ObjectID
+            $QueryGroup = Get-MgGroup -All | Select-Object DisplayName,Description,Id
             if($QueryGroup.DisplayName -notcontains "Enroll_AutoPilot_v1"){
                 $QueryGroup += New-Object psobject -Property @{
                     DisplayName = "Enroll_AutoPilot_v1"
                     Description = "This group is for all devices that have been deployed using this Autopilot profile 'Enroll_AutoPilot_v1' as well as any 'Generic Installers'. Devices deployed through BIIT's script are placed in this group."
-                    ObjectID = $null
+                    Id = $null
                 }
                 Write-Host "The AutoPilot profile 'Enroll_AutoPilot_v1' may not exist because the group Intune_Devices_AutopilotDeployed does not yet exist" -ForegroundColor Red
                 Write-Host "Please talk to infrastructure about ensuring the autopilot profile exists in Intune for this client" -ForegroundColor Red
             }
-            $QueryGroup = $QueryGroup | Select-Object DisplayName,Description,ObjectId | Sort-Object DisplayName | Out-GridView -PassThru -Title "Please select which group you would like to put the device in"
-            if(($null -eq $QueryGroup.ObjectID) -and ($null -ne $QueryGroup)){
-                New-AzureADGroup -DisplayName $QueryGroup.DisplayName -MailEnabled $false -SecurityEnabled $true -MailNickName "NotSet" -Description $QueryGroup.Description
+            $QueryGroup = $QueryGroup | Select-Object DisplayName,Description,Id | Sort-Object DisplayName | Out-GridView -PassThru -Title "Please select which group you would like to put the device in"
+            if(($null -eq $QueryGroup.Id) -and ($null -ne $QueryGroup)){
+                $groupParams = @{
+                    DisplayName = $QueryGroup.DisplayName
+                    MailEnabled = $false
+                    SecurityEnabled = $true
+                    MailNickname = "NotSet"
+                    Description = $QueryGroup.Description
+                }
+                New-MgGroup -BodyParameter $groupParams
             }
         }
 
@@ -264,32 +265,6 @@ Function Enroll-Device(){
 
         #Get Serial Number
         $serial = (Get-WmiObject -class win32_bios).SerialNumber  
-
-    #     #Kick off device upload process
-    #     if(($null -eq $UPN) -or ($UPN -eq "")){
-    #         Get-WindowsAutoPilotInfo -Online -AddToGroup $GroupName -AssignedComputerName $ComputerName
-    #     }else{
-    #         Get-WindowsAutoPilotInfo -Online -AddToGroup $GroupName -AssignedUser $UPN -AssignedComputerName $ComputerName
-    #     }
-    #     $QueryGroup = Get-AzureADGroup -All:$true | Where-Object{$_.displayName -like "*$GroupName*"}
-    #     Write-Host "        
-    #     Veryifying '$serial' is added to the group '$($QueryGroup.displayName)'"
-    #     while($(Get-AzureADGroupMember -ObjectId $QueryGroup.ObjectID -All $true | Select-Object DisplayName).DisplayName -notcontains $serial){
-    #         Write-Host "
-    # Group '$GroupName' does not contain '$serial'" -ForegroundColor Yellow
-    #         Write-Host "
-    # The script will attempt to add the device to the noted group and will wait for 5 seconds after attempting to add it" -ForegroundColor Yellow
-    #         Write-Host "    NOTE: The script will be stuck in this loop until it sees the device added to the needed group. If it is stuck either add it to the noted group manually or restart the script" -ForegroundColor Yellow
-    #         $DeviceQuery = Get-AzureADDevice -SearchString $serial
-    #         foreach($Device in $DeviceQuery){
-    #             Add-AzureADGroupMember -ObjectId $QueryGroup.ObjectID -RefObjectId $Device.ObjectID
-                
-    #         }
-    #         Start-Sleep -Seconds 5
-    #     }
-    #     Write-Host "
-        
-    #     '$serial' is added to the group '$GroupName' moving on with the script. We'll now wait on the autopilot profile to be asigned" -ForegroundColor Green
 
         #Kick off device upload process
         if(($null -eq $UPN) -or ($UPN -eq "")){
@@ -313,30 +288,15 @@ Function Enroll-Device(){
         " -ForegroundColor Yellow
         if($null -ne $UPN){
             while(($addressableUserName -eq "") -and ($userPrincipalName -eq "")){
-                #Connect to AzureAD if it's not connected already if we end up doing the user query
-                Try{
-                    $AzureADConnectionTest = Get-AzureADDomain -Name $($aadId.tenantdomain)
-                    if($AzureADConnectionTest.Name -ne $($aadId.tenantdomain)){
-                        # Write-Host "Looks like you're already connected to Azure AD" -foregroundcolor green
-                    }Else{
-                        $AzureADConnection = Connect-AzureAD -AccountId $Username| Out-Null
-                        $AzureADConnectionTest = Get-AzureADDomain -Name $($aadId.tenantdomain)
+                #Ensure device is in group (using Microsoft Graph)
+                $DeviceObjectID = $(Get-MgDevice -Filter "displayName eq '$serial'").Id
+                $GroupMembershipCheck = $(Get-MgGroupMember -GroupId $QueryGroup.Id -All)
+                if(!($GroupMembershipCheck.Id -contains $DeviceObjectID)){
+                    Write-host "The Azure AD Group $($QueryGroup.DisplayName) did not contain the device $serial | Attempting to add it now. If it fails this will loop forever. To fix this login to the 365 and add the device to the group manually" -ForegroundColor Yellow
+                    $bodyParam = @{
+                        "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$DeviceObjectID"
                     }
-
-                }
-                Catch{
-                    while($AzureADConnectionTest.Name -ne $($aadId.tenantdomain)){
-                        Write-Host "Connecting to Azure AD now" -foregroundcolor yellow
-                        $AzureADConnection = Connect-AzureAD -AccountId $Username | Out-Null
-                        $AzureADConnectionTest = Get-AzureADDomain -Name $($aadId.tenantdomain)
-                    }
-                }
-                #Ensure device is in group
-                $DeviceObjectID = $(Get-AzureADDevice -SearchString $serial).ObjectID
-                $GroupMembershipCheck = $(Get-AzureADGroupMember -ObjectId $QueryGroup.ObjectId -All $true)
-                if(!($GroupMembershipCheck -contains $DeviceObjectID)){
-                    Write-host "The Azure AD Group $($QueryGroup.DisplayName) did not contain the device $serial | Attemptiong to add it now. If it fails this will loop forever. To fix this login to the 365 and add the device to the group manually" -ForegroundColor Yellow
-                    Add-AzureADGroupMember -ObjectId $QueryGroup.ObjectId -RefObjectId $DeviceObjectID 
+                    New-MgGroupMemberByRef -GroupId $QueryGroup.Id -BodyParameter $bodyParam
                 }
                 $DeviceObjectID = $null
                 $GroupMembershipCheck = $null
@@ -348,38 +308,23 @@ Function Enroll-Device(){
                 $userPrincipalName = $Device.userPrincipalName
                 $displayName = $Device.displayName
                 Write-Host "
-        Could not find the assigned user $QueryDisplayName ($UPN) assigned to device $serial. Trying to apply these paramaters again and will query after a 5 second wait timer."
+        Could not find the assigned user $QueryDisplayName ($UPN) assigned to device $serial. Trying to apply these parameters again and will query after a 5 second wait timer."
             }
         }Else{
                 Write-Host "
-        It does look like the Display Name (addressableUserName) and userPrincipalName (Users username to login) assigned fine. It is $QueryDisplayName and $userPrincipalName resptively" -ForegroundColor Green
+        It does look like the Display Name (addressableUserName) and userPrincipalName (Users username to login) assigned fine. It is $QueryDisplayName and $userPrincipalName respectively" -ForegroundColor Green
             }
 
         While($displayName -eq ""){
-            #Connect to AzureAD if it's not connected already if we end up doing the user query
-            Try{
-                $AzureADConnectionTest = Get-AzureADDomain -Name $($aadId.tenantdomain)
-                if($AzureADConnectionTest.Name -ne $($aadId.tenantdomain)){
-                    # Write-Host "Looks like you're already connected to Azure AD" -foregroundcolor green
-                }Else{
-                    $AzureADConnection = Connect-AzureAD -AccountId $Username| Out-Null
-                    $AzureADConnectionTest = Get-AzureADDomain -Name $($aadId.tenantdomain)
-                }
-
-            }
-            Catch{
-                while($AzureADConnectionTest.Name -ne $($aadId.tenantdomain)){
-                    Write-Host "Connecting to Azure AD now" -foregroundcolor yellow
-                    $AzureADConnection = Connect-AzureAD -AccountId $Username | Out-Null
-                    $AzureADConnectionTest = Get-AzureADDomain -Name $($aadId.tenantdomain)
-                }
-            }
-            #Ensure device is in group
-            $DeviceObjectID = $(Get-AzureADDevice -SearchString $serial).ObjectID
-            $GroupMembershipCheck = $(Get-AzureADGroupMember -ObjectId $QueryGroup.ObjectId -All $true)
-            if(!($GroupMembershipCheck -contains $DeviceObjectID)){
+            #Ensure device is in group (using Microsoft Graph)
+            $DeviceObjectID = $(Get-MgDevice -Filter "displayName eq '$serial'").Id
+            $GroupMembershipCheck = $(Get-MgGroupMember -GroupId $QueryGroup.Id -All)
+            if(!($GroupMembershipCheck.Id -contains $DeviceObjectID)){
                 Write-host "The Azure AD Group $($QueryGroup.DisplayName) did not contain the device $serial | Attempting to add it now. If it fails this will loop forever. To fix this login to the 365 and add the device to the group manually" -ForegroundColor Yellow
-                Add-AzureADGroupMember -ObjectId $QueryGroup.ObjectId -RefObjectId $DeviceObjectID 
+                $bodyParam = @{
+                    "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$DeviceObjectID"
+                }
+                New-MgGroupMemberByRef -GroupId $QueryGroup.Id -BodyParameter $bodyParam
             }
             $DeviceObjectID = $null
             $GroupMembershipCheck = $null
@@ -390,7 +335,7 @@ Function Enroll-Device(){
             $displayName = $Device.displayName
             if($displayName -eq ""){
                 Write-Host "
-            Could not find the computer name $ComputerName assigned to device $serial. Trying to apply these paramaters again and will query after a 5 second wait timer."
+            Could not find the computer name $ComputerName assigned to device $serial. Trying to apply these parameters again and will query after a 5 second wait timer."
             }Else{
                 Write-Host "
             It does look like the displayName (computer name) assigned fine. It is set as $ComputerName " -ForegroundColor Green
@@ -411,7 +356,7 @@ Function Enroll-Device(){
 
         ==================================================================
         Script has finished (Import-Module -Name Skyrim -assignDialog 'Gods be praised').
-        Please REVIEW the below paramaters and ensure they are correct.
+        Please REVIEW the below parameters and ensure they are correct.
         If they are continue with the deployment please.
         ------------------------------------------------------------------" -ForegroundColor Green
         Write-Host "
@@ -2355,6 +2300,7 @@ Function Get-WindowsAutoPilotInfo(){
     }
 }
 #EndRegion - Get-WindowsAutopilotInfo
+
 #Region - Menu
 do {
     do {
