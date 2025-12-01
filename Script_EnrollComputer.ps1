@@ -1997,16 +1997,8 @@ Function Get-WindowsAutoPilotInfo(){
             }
             Import-Module WindowsAutopilotIntune -Scope Global
 
-            # Get Azure AD if needed
-            if ($AddToGroup)
-            {
-                $module = Import-Module AzureAD -PassThru -ErrorAction Ignore
-                if (-not $module)
-                {
-                    Write-Host "Installing module AzureAD"
-                    Install-Module AzureAD -Force
-                }
-            }
+            # Microsoft Graph modules are already loaded by the main Enroll-Device function
+            # No need to load deprecated AzureAD module
 
             # Connect
             if ($AppId -ne "")
@@ -2018,12 +2010,8 @@ Function Get-WindowsAutoPilotInfo(){
             else {
                 # $graph = Connect-MSGraph
                 # Write-Host "Connected to Intune tenant $($graph.TenantId)"
-                Write-Host "Hit need to conenct to MSGraph but this is currently commented out"
-                if ($AddToGroup)
-                {
-                    $aadId = Connect-AzureAD
-                    Write-Host "Connected to Azure AD tenant $($aadId.TenantId.GUID)"
-                }
+                Write-Host "Using existing Microsoft Graph connection from Enroll-Device function"
+                # No need to connect to AzureAD separately - Microsoft Graph is already connected
             }
 
             # Force the output to a file
@@ -2240,20 +2228,52 @@ Function Get-WindowsAutoPilotInfo(){
             # Add the device to the specified AAD group
             if ($AddToGroup)
             {
-                $aadGroup = Get-AzureADGroup -Filter "DisplayName eq '$AddToGroup'"
+                # Using Microsoft Graph instead of deprecated AzureAD module
+                $aadGroup = Get-MgGroup -Filter "displayName eq '$AddToGroup'" -ErrorAction SilentlyContinue
                 if ($aadGroup)
                 {
                     $autopilotDevices | % {
-                        $aadDevice = Get-AzureADDevice -ObjectId "deviceid_$($_.azureActiveDirectoryDeviceId)"
+                        $deviceId = $_.azureActiveDirectoryDeviceId
+                        $serialNum = $_.serialNumber
+                        
+                        # Retry logic - device may not be immediately available in Azure AD
+                        $maxRetries = 12
+                        $retryCount = 0
+                        $aadDevice = $null
+                        
+                        while (($null -eq $aadDevice) -and ($retryCount -lt $maxRetries)) {
+                            $aadDevice = Get-MgDevice -Filter "deviceId eq '$deviceId'" -ErrorAction SilentlyContinue
+                            if ($null -eq $aadDevice) {
+                                $retryCount++
+                                if ($retryCount -lt $maxRetries) {
+                                    Write-Host "Device $serialNum not yet available in Azure AD. Waiting 15 seconds... (Attempt $retryCount of $maxRetries)"
+                                    Start-Sleep -Seconds 15
+                                }
+                            }
+                        }
+                        
                         if ($aadDevice) {
-                            Write-Host "Adding device $($_.serialNumber) to group $AddToGroup"
-                            Add-AzureADGroupMember -ObjectId $aadGroup.ObjectId -RefObjectId $aadDevice.ObjectId
+                            Write-Host "Adding device $serialNum to group $AddToGroup"
+                            try {
+                                $bodyParam = @{
+                                    "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$($aadDevice.Id)"
+                                }
+                                New-MgGroupMemberByRef -GroupId $aadGroup.Id -BodyParameter $bodyParam -ErrorAction Stop
+                            }
+                            catch {
+                                if ($_.Exception.Message -like "*already exist*") {
+                                    Write-Host "Device $serialNum is already a member of group $AddToGroup"
+                                }
+                                else {
+                                    Write-Error "Failed to add device $serialNum to group: $($_.Exception.Message)"
+                                }
+                            }
                         }
                         else {
-                            Write-Error "Unable to find Azure AD device with ID $($_.azureActiveDirectoryDeviceId)"
+                            Write-Error "Unable to find Azure AD device with ID $deviceId after $maxRetries attempts"
                         }
                     }
-                    Write-Host "Added devices to group '$AddToGroup' ($($aadGroup.ObjectId))"
+                    Write-Host "Added devices to group '$AddToGroup' ($($aadGroup.Id))"
                 }
                 else {
                     Write-Error "Unable to find group $AddToGroup"
