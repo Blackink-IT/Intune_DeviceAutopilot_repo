@@ -2321,6 +2321,202 @@ Function Get-WindowsAutoPilotInfo(){
 }
 #EndRegion - Get-WindowsAutopilotInfo
 
+#Region - BIIT MSP Portal upload
+# PRP-29 (2026-04-24) — Upload hardware hash + serial + model from this
+# OOBE device directly into the BIIT MSP Portal's Autopilot intake queue.
+# A tech on a BIIT laptop finishes the intake (sets primary user + final
+# hostname + Autopilot profile) from /immy/autopilot/pending.
+#
+# Two auth paths:
+#   [1] Sign in with BIIT credentials  — MSAL interactive on the OOBE
+#       device itself (device-code fallback on interactive failure).
+#   [2] Enroll with a 6-digit code     — BIIT tech generates a code in
+#       the portal and hands it to the OOBE operator. No BIIT credentials
+#       leave the portal laptop.
+
+Function Invoke-BiitPortalUpload() {
+    # Hardcoded constants — safe in a public repo (public-client app IDs
+    # + app ID URI + api hostname only; no secrets).
+    $BiitTenantId                = "fdec8e68-1a98-4a07-96ca-61d6960dd020"
+    $BiitAutopilotIntakeClientId = "9446f70b-ad62-4bcb-aa07-7bc58fecc2f9"
+    $BiitAutopilotIntakeScope    = "api://d0e751e8-fac8-429c-98a5-53939e92f535/Autopilot.Intake"
+    $PortalApiBase               = "https://2xo4m98krh.execute-api.us-east-2.amazonaws.com/prod"
+
+    Write-Host "`n--- BIIT MSP Portal Upload ---" -ForegroundColor Cyan
+    Write-Host "[1] Sign in with BIIT credentials (default)"
+    Write-Host "[2] Enroll with a 6-digit code from the portal"
+    Write-Host "[3] Cancel"
+    $uploadPath = Read-Host "`nSelect an option"
+    if ($uploadPath -eq "3" -or [string]::IsNullOrWhiteSpace($uploadPath)) {
+        Write-Host "Cancelled." -ForegroundColor Yellow
+        return
+    }
+    if ($uploadPath -notin @("1","2")) {
+        Write-Host "Invalid selection." -ForegroundColor Red
+        return
+    }
+
+    # Collect hardware hash + serial + make/model via the existing
+    # Get-WindowsAutoPilotInfo helper already in this script. We call it
+    # with -OutputFile and then re-read the CSV so we get exactly the
+    # same bytes as the classic Autopilot import flow.
+    $tmp = Join-Path $env:TEMP "biit-autopilot-hash-$([guid]::NewGuid().ToString()).csv"
+    try {
+        Write-Host "`nGathering hardware hash…" -ForegroundColor Gray
+        Get-WindowsAutoPilotInfo -OutputFile $tmp
+        if (-not (Test-Path $tmp)) {
+            Write-Host "Hash capture failed — Get-WindowsAutoPilotInfo produced no output." -ForegroundColor Red
+            return
+        }
+        $row = Import-Csv $tmp | Select-Object -First 1
+        if (-not $row) {
+            Write-Host "Hash capture failed — CSV empty." -ForegroundColor Red
+            return
+        }
+        $hardwareHash  = $row."Hardware Hash"
+        $serialNumber  = $row."Device Serial Number"
+    } finally {
+        if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($hardwareHash) -or [string]::IsNullOrWhiteSpace($serialNumber)) {
+        Write-Host "Hash or serial missing from Autopilot output — cannot upload." -ForegroundColor Red
+        return
+    }
+
+    # Model + device type from CIM — independent of the AutoPilot CSV.
+    $cs = Get-CimInstance -Class Win32_ComputerSystem
+    $model = $cs.Model.Trim()
+    # Map Win32_ComputerSystem PCSystemType to our intake enum.
+    # 1=Desktop, 2=Mobile(Laptop), 3=Workstation, 4=EnterpriseServer, 5=SOHOServer,
+    # 6=AppliancePC, 7=PerformanceServer, 8=Maximum. Surface/AllInOne aren't
+    # distinguishable from Win32_ComputerSystem — tech picks at Finish.
+    $deviceType = switch ($cs.PCSystemType) {
+        1 { "Desktop" }
+        2 { "Laptop" }
+        3 { "Workstation" }
+        default { "Laptop" }
+    }
+
+    Write-Host "  Serial: $serialNumber"
+    Write-Host "  Model:  $model"
+    Write-Host "  Type:   $deviceType"
+
+    if ($uploadPath -eq "1") {
+        # Path 1 — BIIT MSAL login on the OOBE device.
+        Write-Host "`nAcquiring BIIT token…" -ForegroundColor Gray
+        if (-not (Get-Module -ListAvailable -Name MSAL.PS)) {
+            try {
+                Install-Module MSAL.PS -Force -Scope CurrentUser -AcceptLicense -ErrorAction Stop
+            } catch {
+                Write-Host "Could not install MSAL.PS — falling back to Path 2 (6-digit code) recommended." -ForegroundColor Red
+                Write-Host "Error: $_" -ForegroundColor Red
+                return
+            }
+        }
+        Import-Module MSAL.PS -ErrorAction Stop
+
+        $token = $null
+        try {
+            $msalToken = Get-MsalToken -ClientId $BiitAutopilotIntakeClientId `
+                                       -TenantId $BiitTenantId `
+                                       -Scopes  $BiitAutopilotIntakeScope `
+                                       -Interactive -ErrorAction Stop
+            $token = $msalToken.AccessToken
+        } catch {
+            Write-Host "Interactive login failed — trying device-code flow." -ForegroundColor Yellow
+            try {
+                $msalToken = Get-MsalToken -ClientId $BiitAutopilotIntakeClientId `
+                                           -TenantId $BiitTenantId `
+                                           -Scopes  $BiitAutopilotIntakeScope `
+                                           -DeviceCode -ErrorAction Stop
+                $token = $msalToken.AccessToken
+            } catch {
+                Write-Host "Could not acquire BIIT token: $_" -ForegroundColor Red
+                return
+            }
+        }
+
+        # Pick a tenant from the portal's tenant list.
+        Write-Host "`nFetching BIIT tenant list…" -ForegroundColor Gray
+        try {
+            $tenantsResp = Invoke-RestMethod -Method GET `
+                -Uri "$PortalApiBase/immy/autopilot/intake-from-script/tenants" `
+                -Headers @{ Authorization = "Bearer $token" }
+        } catch {
+            Write-Host "Could not fetch tenant list: $_" -ForegroundColor Red
+            return
+        }
+        $tenants = @($tenantsResp.tenants)
+        if ($tenants.Count -eq 0) {
+            Write-Host "No tenants returned from portal." -ForegroundColor Red
+            return
+        }
+        Write-Host ""
+        for ($i = 0; $i -lt $tenants.Count; $i++) {
+            Write-Host ("  [{0,2}] {1} ({2})" -f ($i+1), $tenants[$i].displayName, $tenants[$i].clientIdentifier)
+        }
+        $choice = Read-Host "`nSelect tenant (number)"
+        $idx = ($choice -as [int]) - 1
+        if ($idx -lt 0 -or $idx -ge $tenants.Count) {
+            Write-Host "Invalid selection." -ForegroundColor Red
+            return
+        }
+        $clientIdentifier = $tenants[$idx].clientIdentifier
+
+        $body = @{
+            clientIdentifier = $clientIdentifier
+            hardwareHash     = $hardwareHash
+            serialNumber     = $serialNumber
+            model            = $model
+            deviceType       = $deviceType
+        } | ConvertTo-Json -Compress
+
+        try {
+            $resp = Invoke-RestMethod -Method POST `
+                -Uri "$PortalApiBase/immy/autopilot/intake-from-script" `
+                -Headers @{ Authorization = "Bearer $token" } `
+                -ContentType "application/json" `
+                -Body $body
+            Write-Host "`nUploaded." -ForegroundColor Green
+            Write-Host "  Intake ID:  $($resp.intakeId)"
+            Write-Host "  Portal:     https://portal.blackinkit.com/immy/autopilot/pending"
+        } catch {
+            Write-Host "Upload failed: $_" -ForegroundColor Red
+        }
+    }
+    else {
+        # Path 2 — 6-digit code (unauthenticated POST; code carries the auth).
+        $code = Read-Host "`nEnter the 6-digit intake code the BIIT tech gave you"
+        $code = $code.Trim()
+        if ($code -notmatch '^\d{6}$') {
+            Write-Host "Code must be 6 digits." -ForegroundColor Red
+            return
+        }
+        $body = @{
+            code         = $code
+            hardwareHash = $hardwareHash
+            serialNumber = $serialNumber
+            model        = $model
+            deviceType   = $deviceType
+        } | ConvertTo-Json -Compress
+
+        try {
+            $resp = Invoke-RestMethod -Method POST `
+                -Uri "$PortalApiBase/immy/autopilot/intake-by-code" `
+                -ContentType "application/json" `
+                -Body $body
+            Write-Host "`nUploaded." -ForegroundColor Green
+            Write-Host "  Intake ID: $($resp.intakeId)"
+            Write-Host "  $($resp.message)"
+        } catch {
+            Write-Host "Upload failed: $_" -ForegroundColor Red
+            Write-Host "(Codes are single-use and invalidate after 5 failed attempts.)" -ForegroundColor Yellow
+        }
+    }
+}
+#EndRegion - BIIT MSP Portal upload
+
 #Region - Menu
 do {
     do {
@@ -2333,6 +2529,7 @@ do {
 [2] REMOVE Device from Autopilot, Intune, and Azure | Use this if a deployment fails before just trying again
 [3] Get devices deployment status | Useful for getting the ID's of apps a deployment is hung on
 [4] Update windows | Use this if it's a brand new computer and you sense there will be updates to install. Run BEFORE you enroll the device in Intune
+[5] Upload this device to the BIIT MSP Portal | Sends hash + serial to the Portal's Autopilot intake queue for a tech to finish
 
 [0] Exit Script
 -----
@@ -2382,8 +2579,9 @@ do {
                 }
             }
             4 { UpdateWindows }
+            5 { Invoke-BiitPortalUpload }
             0 { Stop-Transcript;exit }
         }
-    }  while($userAction -notmatch "[12340]")
+    }  while($userAction -notmatch "[123450]")
 } until($userAction -eq "0")
 #EndRegion - Menu
