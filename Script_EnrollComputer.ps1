@@ -2446,24 +2446,49 @@ Function Invoke-BiitPortalUpload() {
         }
         Import-Module MSAL.PS -ErrorAction Stop
 
+        # Reuse a token from earlier in this script session if one is still
+        # valid (≥ 2 min until expiry). Avoids re-prompting MSAL every time
+        # the operator picks option 5 again. Cleared automatically when
+        # the script exits — no on-disk persistence.
         $token = $null
-        try {
-            $msalToken = Get-MsalToken -ClientId $BiitAutopilotIntakeClientId `
-                                       -TenantId $BiitTenantId `
-                                       -Scopes  $BiitAutopilotIntakeScope `
-                                       -Interactive -ErrorAction Stop
-            $token = $msalToken.AccessToken
-        } catch {
-            Write-Host "Interactive login failed — trying device-code flow." -ForegroundColor Yellow
+        if ($script:BiitIntakeToken -and $script:BiitIntakeTokenExpiresAt -and `
+            $script:BiitIntakeTokenExpiresAt -gt (Get-Date).AddMinutes(2)) {
+            $token = $script:BiitIntakeToken
+            $expiresIn = [int](($script:BiitIntakeTokenExpiresAt - (Get-Date)).TotalMinutes)
+            Write-Host "Using cached BIIT token (expires in ~$expiresIn min)." -ForegroundColor Gray
+        }
+
+        if (-not $token) {
             try {
                 $msalToken = Get-MsalToken -ClientId $BiitAutopilotIntakeClientId `
                                            -TenantId $BiitTenantId `
                                            -Scopes  $BiitAutopilotIntakeScope `
-                                           -DeviceCode -ErrorAction Stop
+                                           -Interactive -ErrorAction Stop
                 $token = $msalToken.AccessToken
+                $script:BiitIntakeToken          = $token
+                $script:BiitIntakeTokenExpiresAt = $msalToken.ExpiresOn.LocalDateTime
             } catch {
-                Write-Host "Could not acquire BIIT token: $_" -ForegroundColor Red
-                return
+                Write-Host "`nInteractive login failed or was cancelled." -ForegroundColor Yellow
+                Write-Host "  Reason: $_" -ForegroundColor DarkGray
+                Write-Host "`nDevice-code flow is an alternative — you'd visit https://microsoft.com/devicelogin"
+                Write-Host "on a phone or another browser and enter a one-time code from this terminal."
+                $tryDeviceCode = Read-Host "Try device-code flow now? [y/N]"
+                if ($tryDeviceCode -notmatch '^[yY]') {
+                    Write-Host "Cancelled. Use option [2] (6-digit portal code) if you can't sign in here." -ForegroundColor Yellow
+                    return
+                }
+                try {
+                    $msalToken = Get-MsalToken -ClientId $BiitAutopilotIntakeClientId `
+                                               -TenantId $BiitTenantId `
+                                               -Scopes  $BiitAutopilotIntakeScope `
+                                               -DeviceCode -ErrorAction Stop
+                    $token = $msalToken.AccessToken
+                    $script:BiitIntakeToken          = $token
+                    $script:BiitIntakeTokenExpiresAt = $msalToken.ExpiresOn.LocalDateTime
+                } catch {
+                    Write-Host "Could not acquire BIIT token: $_" -ForegroundColor Red
+                    return
+                }
             }
         }
 
