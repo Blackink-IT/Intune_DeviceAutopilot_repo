@@ -2356,27 +2356,24 @@ Function Invoke-BiitPortalUpload() {
         return
     }
 
-    # Collect hardware hash + serial + make/model via the existing
-    # Get-WindowsAutoPilotInfo helper already in this script. We call it
-    # with -OutputFile and then re-read the CSV so we get exactly the
-    # same bytes as the classic Autopilot import flow.
-    $tmp = Join-Path $env:TEMP "biit-autopilot-hash-$([guid]::NewGuid().ToString()).csv"
+    # Pull the hash + serial directly via WMI — mirrors what
+    # Get-WindowsAutoPilotInfo does internally. Avoids that helper's
+    # parameter-set quirk where omitting -Online prompts the operator
+    # interactively because -Online is Mandatory in its parameter set.
+    Write-Host "`nGathering hardware hash…" -ForegroundColor Gray
+    $hardwareHash = $null
+    $serialNumber = $null
     try {
-        Write-Host "`nGathering hardware hash…" -ForegroundColor Gray
-        Get-WindowsAutoPilotInfo -OutputFile $tmp
-        if (-not (Test-Path $tmp)) {
-            Write-Host "Hash capture failed — Get-WindowsAutoPilotInfo produced no output." -ForegroundColor Red
-            return
-        }
-        $row = Import-Csv $tmp | Select-Object -First 1
-        if (-not $row) {
-            Write-Host "Hash capture failed — CSV empty." -ForegroundColor Red
-            return
-        }
-        $hardwareHash  = $row."Hardware Hash"
-        $serialNumber  = $row."Device Serial Number"
-    } finally {
-        if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+        $bios = Get-CimInstance -Class Win32_BIOS -ErrorAction Stop
+        $serialNumber = ($bios.SerialNumber | Out-String).Trim()
+        $devDetail = Get-CimInstance -Namespace root/cimv2/mdm/dmmap `
+            -Class MDM_DevDetail_Ext01 `
+            -Filter "InstanceID='Ext' AND ParentID='./DevDetail'" `
+            -ErrorAction Stop
+        $hardwareHash = $devDetail.DeviceHardwareData
+    } catch {
+        Write-Host "Hash capture failed via WMI: $_" -ForegroundColor Red
+        return
     }
 
     if ([string]::IsNullOrWhiteSpace($hardwareHash) -or [string]::IsNullOrWhiteSpace($serialNumber)) {
