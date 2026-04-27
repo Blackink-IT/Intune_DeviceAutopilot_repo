@@ -2497,7 +2497,8 @@ Function Invoke-BiitPortalUpload() {
         try {
             $tenantsResp = Invoke-RestMethod -Method GET `
                 -Uri "$PortalApiBase/immy/autopilot/intake-from-script/tenants" `
-                -Headers @{ Authorization = "Bearer $token" }
+                -Headers @{ Authorization = "Bearer $token" } `
+                -TimeoutSec 30 -DisableKeepAlive
         } catch {
             Write-Host "Could not fetch tenant list: $_" -ForegroundColor Red
             return
@@ -2528,11 +2529,13 @@ Function Invoke-BiitPortalUpload() {
         } | ConvertTo-Json -Compress
 
         try {
+            Write-Host "`nUploading to portal (30s timeout)…" -ForegroundColor Gray
             $resp = Invoke-RestMethod -Method POST `
                 -Uri "$PortalApiBase/immy/autopilot/intake-from-script" `
                 -Headers @{ Authorization = "Bearer $token" } `
                 -ContentType "application/json" `
-                -Body $body
+                -Body $body `
+                -TimeoutSec 30 -DisableKeepAlive
             Write-Host "`nUploaded." -ForegroundColor Green
             Write-Host "  Intake ID:  $($resp.intakeId)"
             Write-Host "  Portal:     https://portal.blackinkit.com/immy/autopilot/pending"
@@ -2557,10 +2560,12 @@ Function Invoke-BiitPortalUpload() {
         } | ConvertTo-Json -Compress
 
         try {
+            Write-Host "`nUploading to portal (30s timeout)…" -ForegroundColor Gray
             $resp = Invoke-RestMethod -Method POST `
                 -Uri "$PortalApiBase/immy/autopilot/intake-by-code" `
                 -ContentType "application/json" `
-                -Body $body
+                -Body $body `
+                -TimeoutSec 30 -DisableKeepAlive
             Write-Host "`nUploaded." -ForegroundColor Green
             Write-Host "  Intake ID: $($resp.intakeId)"
             Write-Host "  $($resp.message)"
