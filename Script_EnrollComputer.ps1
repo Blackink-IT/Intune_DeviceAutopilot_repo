@@ -2403,8 +2403,26 @@ Function Invoke-BiitPortalUpload() {
         # Path 1 — BIIT MSAL login on the OOBE device.
         Write-Host "`nAcquiring BIIT token…" -ForegroundColor Gray
         if (-not (Get-Module -ListAvailable -Name MSAL.PS)) {
+            # OOBE / Windows Setup ships PowerShellGet 1.x which doesn't
+            # know -AcceptLicense, and may be missing the NuGet provider
+            # entirely. Bootstrap NuGet first, then install MSAL.PS without
+            # the AcceptLicense switch (MSAL.PS has no license-accept flow).
             try {
-                Install-Module MSAL.PS -Force -Scope CurrentUser -AcceptLicense -ErrorAction Stop
+                if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+                    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+                }
+                # PSGallery is Untrusted by default; suppress the prompt for the install only.
+                $prevPolicy = (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue).InstallationPolicy
+                if ($prevPolicy -and $prevPolicy -ne 'Trusted') {
+                    Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+                }
+                try {
+                    Install-Module MSAL.PS -Force -Scope CurrentUser -ErrorAction Stop
+                } finally {
+                    if ($prevPolicy -and $prevPolicy -ne 'Trusted') {
+                        Set-PSRepository -Name PSGallery -InstallationPolicy $prevPolicy
+                    }
+                }
             } catch {
                 Write-Host "Could not install MSAL.PS — falling back to Path 2 (6-digit code) recommended." -ForegroundColor Red
                 Write-Host "Error: $_" -ForegroundColor Red
