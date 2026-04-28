@@ -2508,17 +2508,36 @@ Function Invoke-BiitPortalUpload() {
             Write-Host "No tenants returned from portal." -ForegroundColor Red
             return
         }
-        Write-Host ""
-        for ($i = 0; $i -lt $tenants.Count; $i++) {
-            Write-Host ("  [{0,2}] {1} ({2})" -f ($i+1), $tenants[$i].displayName, $tenants[$i].clientIdentifier)
+        # Re-prompt loop — operator can confirm the chosen tenant or pick again.
+        $clientIdentifier = $null
+        $selectedTenant   = $null
+        while ($null -eq $clientIdentifier) {
+            Write-Host ""
+            for ($i = 0; $i -lt $tenants.Count; $i++) {
+                Write-Host ("  [{0,2}] {1} ({2})" -f ($i+1), $tenants[$i].displayName, $tenants[$i].clientIdentifier)
+            }
+            $choice = Read-Host "`nSelect tenant (number, or Q to quit)"
+            if ($choice -match '^[qQ]$') {
+                Write-Host "Cancelled." -ForegroundColor Yellow
+                return
+            }
+            $idx = ($choice -as [int]) - 1
+            if ($idx -lt 0 -or $idx -ge $tenants.Count) {
+                Write-Host "Invalid selection." -ForegroundColor Red
+                continue
+            }
+            $candidate = $tenants[$idx]
+            Write-Host ""
+            Write-Host ("You selected: {0} ({1})" -f $candidate.displayName, $candidate.clientIdentifier) -ForegroundColor Cyan
+            $confirm = Read-Host "Is this the correct client? [Y/n]"
+            if ($confirm -match '^[nN]$') {
+                Write-Host "OK — pick again." -ForegroundColor Yellow
+                continue
+            }
+            # Empty input or any non-N response confirms.
+            $selectedTenant   = $candidate
+            $clientIdentifier = $candidate.clientIdentifier
         }
-        $choice = Read-Host "`nSelect tenant (number)"
-        $idx = ($choice -as [int]) - 1
-        if ($idx -lt 0 -or $idx -ge $tenants.Count) {
-            Write-Host "Invalid selection." -ForegroundColor Red
-            return
-        }
-        $clientIdentifier = $tenants[$idx].clientIdentifier
 
         $body = @{
             clientIdentifier = $clientIdentifier
