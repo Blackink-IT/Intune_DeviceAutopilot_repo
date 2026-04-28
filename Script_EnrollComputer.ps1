@@ -2551,12 +2551,34 @@ Function Invoke-BiitPortalUpload() {
             Write-Host "Code must be 6 digits." -ForegroundColor Red
             return
         }
+
+        # PRP-39 item 1+2 — name prompt for audit trail. Optional for single-use
+        # codes (backend stores it on the pending intake row + deployment row);
+        # REQUIRED for multi-use codes (backend rejects unpinned redemptions
+        # with a generic 401 from redemption #2 onward).
+        $attempt = 0
+        $redeemedByName = ''
+        while ($attempt -lt 3) {
+            $redeemedByName = (Read-Host "`nYour full name (for audit trail)").Trim()
+            if (-not [string]::IsNullOrWhiteSpace($redeemedByName)) { break }
+            Write-Host "Name required — please enter your full name." -ForegroundColor Yellow
+            $attempt++
+        }
+        if ([string]::IsNullOrWhiteSpace($redeemedByName)) {
+            Write-Host "No name provided after 3 attempts — aborting." -ForegroundColor Red
+            return
+        }
+        if ($redeemedByName.Length -gt 80) {
+            $redeemedByName = $redeemedByName.Substring(0, 80)
+        }
+
         $body = @{
-            code         = $code
-            hardwareHash = $hardwareHash
-            serialNumber = $serialNumber
-            model        = $model
-            deviceType   = $deviceType
+            code           = $code
+            hardwareHash   = $hardwareHash
+            serialNumber   = $serialNumber
+            model          = $model
+            deviceType     = $deviceType
+            redeemedByName = $redeemedByName
         } | ConvertTo-Json -Compress
 
         try {
