@@ -2578,20 +2578,152 @@ Function Invoke-BiitPortalUpload() {
 #EndRegion - BIIT MSP Portal upload
 
 #Region - BIIT MSP Portal diagnostic upload (PRP-57 Phase C)
+Function Build-BiitOobeContextFile {
+    <#
+    Builds a single text file at C:\Windows\Temp\oobe-context-{serial}.txt
+    containing the script-gathered diagnostics that aren't already in the
+    MdmDiagnosticsTool CAB:
+      - dsregcmd /status (load-bearing for AAD-join failures like 0x801c03f3
+        DSREG_AUTOREG_DEVICE_NOT_FOUND — the AzureAdJoined / DomainJoined /
+        WorkplaceJoined block + cert chain + DRS endpoint + tenant detail)
+      - HKLM:\SOFTWARE\Microsoft\Enrollments registry tree (stale GUIDs
+        commonly cause 0x801c03f3 by competing with new enrollment)
+      - HKLM:\SOFTWARE\Microsoft\Provisioning\AutopilotPolicy + DiagTracking
+      - Recent Event Log entries from the channels Microsoft ships
+        Autopilot/AAD/MDM events on (User Device Registration, AAD,
+        ModernDeployment-Diagnostics-Provider Autopilot, Provisioning-
+        Diagnostics-Provider, DeviceManagement-Enterprise-Diagnostics-Provider)
+      - Network reachability for the four endpoints whiteglove device-setup
+        depends on (enterpriseregistration / device.login / login /
+        enrollment.manage.microsoft.com — port 443)
+      - Time sync + UTC offset (clock skew breaks token validation)
+
+    Returns the file path on success, $null on hard failure. Each section
+    is wrapped in try/catch so one failure doesn't abort the rest.
+    #>
+    param([string]$Serial)
+
+    $contextPath = "C:\Windows\Temp\oobe-context-$Serial.txt"
+    $sb = New-Object System.Text.StringBuilder
+
+    function Add-Section { param([string]$Title) [void]$sb.AppendLine(""); [void]$sb.AppendLine("=" * 72); [void]$sb.AppendLine($Title); [void]$sb.AppendLine("=" * 72) }
+    function Add-Line { param([string]$Line) [void]$sb.AppendLine($Line) }
+
+    Add-Section "BIIT MSP Portal — OOBE diagnostic context"
+    Add-Line "Generated:  $((Get-Date).ToUniversalTime().ToString('o'))"
+    Add-Line "Serial:     $Serial"
+    Add-Line "Computer:   $env:COMPUTERNAME"
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        Add-Line "OS:         $($os.Caption) build $($os.BuildNumber)"
+        Add-Line "Last boot:  $($os.LastBootUpTime)"
+    } catch { Add-Line "OS info: $_" }
+    try { Add-Line "TZ:         $((Get-TimeZone).DisplayName)" } catch {}
+
+    Add-Section "dsregcmd /status"
+    try {
+        $dsreg = & dsregcmd /status 2>&1 | Out-String
+        Add-Line $dsreg
+    } catch { Add-Line "dsregcmd failed: $_" }
+
+    Add-Section "HKLM:\SOFTWARE\Microsoft\Enrollments"
+    try {
+        $regOut = & reg.exe query 'HKLM\SOFTWARE\Microsoft\Enrollments' /s 2>&1 | Out-String
+        Add-Line $regOut
+    } catch { Add-Line "Enrollments registry read failed: $_" }
+
+    Add-Section "HKLM:\SOFTWARE\Microsoft\Provisioning\AutopilotPolicy"
+    try {
+        $regOut = & reg.exe query 'HKLM\SOFTWARE\Microsoft\Provisioning\AutopilotPolicy' /s 2>&1 | Out-String
+        Add-Line $regOut
+    } catch { Add-Line "AutopilotPolicy registry read failed: $_" }
+
+    Add-Section "HKLM:\SOFTWARE\Microsoft\Provisioning\Diagnostics"
+    try {
+        $regOut = & reg.exe query 'HKLM\SOFTWARE\Microsoft\Provisioning\Diagnostics\AutoPilot' /s 2>&1 | Out-String
+        Add-Line $regOut
+    } catch { Add-Line "Provisioning diagnostics registry read failed: $_" }
+
+    $eventLogs = @(
+        'Microsoft-Windows-User Device Registration/Admin',
+        'Microsoft-Windows-AAD/Operational',
+        'Microsoft-Windows-ModernDeployment-Diagnostics-Provider/Autopilot',
+        'Microsoft-Windows-ModernDeployment-Diagnostics-Provider/ManagementService',
+        'Microsoft-Windows-Provisioning-Diagnostics-Provider/Admin',
+        'Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Admin'
+    )
+    foreach ($lg in $eventLogs) {
+        Add-Section "Event Log — $lg (most recent 50 events)"
+        try {
+            $events = Get-WinEvent -LogName $lg -MaxEvents 50 -ErrorAction Stop
+            foreach ($ev in $events) {
+                $msg = if ($ev.Message) { $ev.Message -replace "`r`n", " | " -replace "`n", " | " } else { "<no message>" }
+                if ($msg.Length -gt 500) { $msg = $msg.Substring(0, 500) + "...[truncated]" }
+                Add-Line ("[{0}] L={1} ID={2} Src={3} :: {4}" -f $ev.TimeCreated.ToString('s'), $ev.LevelDisplayName, $ev.Id, $ev.ProviderName, $msg)
+            }
+        } catch {
+            # Channel might not exist on this Windows SKU/build; not fatal.
+            Add-Line "Could not read: $($_.Exception.Message)"
+        }
+    }
+
+    Add-Section "Network reachability (Autopilot / AAD / MDM endpoints, port 443)"
+    $endpoints = @(
+        'enterpriseregistration.windows.net',
+        'device.login.microsoftonline.com',
+        'login.microsoftonline.com',
+        'enrollment.manage.microsoft.com',
+        'manage.microsoft.com',
+        'graph.microsoft.com'
+    )
+    foreach ($ep in $endpoints) {
+        try {
+            $r = Test-NetConnection -ComputerName $ep -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction Stop
+            Add-Line ("  {0}:443 = {1}" -f $ep, $r)
+        } catch {
+            Add-Line ("  {0}:443 = error: {1}" -f $ep, $_.Exception.Message)
+        }
+    }
+
+    Add-Section "Time sync (w32tm /query /status)"
+    try {
+        $w32 = & w32tm /query /status 2>&1 | Out-String
+        Add-Line $w32
+    } catch { Add-Line "w32tm failed: $_" }
+
+    Add-Section "ipconfig /all"
+    try {
+        $ipc = & ipconfig /all 2>&1 | Out-String
+        Add-Line $ipc
+    } catch { Add-Line "ipconfig failed: $_" }
+
+    try {
+        [System.IO.File]::WriteAllText($contextPath, $sb.ToString())
+        return $contextPath
+    } catch {
+        Write-Host "  Failed to write oobe-context.txt: $_" -ForegroundColor Yellow
+        return $null
+    }
+}
+
 Function Invoke-BiitDiagnosticsCapture {
     <#
     Captures Autopilot + Intune-side diagnostic logs into base64-encoded
     blobs ready to POST. Returns an array of @{filename; contentBase64}
     hashtables (or $null on hard failure).
 
-    Sources:
+    Sources (5-file backend cap):
       1. MdmDiagnosticsTool.exe -area Autopilot;DeviceProvisioning -cab ...
          Microsoft's canonical Autopilot diag tool — bundles the relevant
-         registry hives + log files into a single CAB.
-      2. C:\ProgramData\Microsoft\IntuneManagementExtension\Logs\*.log
-         IME side (Win32 app installs, sidecar agent activity).
-      3. C:\Windows\Temp\PS-*.log + C:\Windows\Temp\EnrollmentScript - *.log
-         This script's own transcript (line 2 of the script).
+         registry hives + log files + ETL traces into a single CAB.
+      2. oobe-context-{serial}.txt (script-built) — dsregcmd /status,
+         enrollment registry tree, AutopilotPolicy registry, recent Event
+         Log entries from 6 Autopilot/AAD/MDM channels, network reachability,
+         time sync, ipconfig. Designed to make 0x801c03f3-class AAD-join
+         failures self-diagnosable from a single file.
+      3. Newest IntuneManagementExtension log (Win32 app installs, sidecar).
+      4. Newest EnrollmentScript transcript (this script's own log).
+      5. Newest PS-*.log (PowerShell session transcript).
 
     Each file is capped at $MaxBytes (default 10 MB) before encoding;
     files larger than the cap are tail-truncated to the last $MaxBytes
@@ -2622,26 +2754,37 @@ Function Invoke-BiitDiagnosticsCapture {
         }
     } catch {
         Write-Host "  MdmDiagnosticsTool failed: $_" -ForegroundColor Yellow
-        # Continue — we still have IME + script logs.
+        # Continue — we still have IME + script logs + the script-built context.
     }
 
     $candidates = @()
     if (Test-Path $cabPath) { $candidates += (Get-Item $cabPath) }
 
-    # 2) IME logs.
-    $imeDir = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs"
-    if (Test-Path $imeDir) {
-        # Newest first — the failure signal is usually in the most recent log.
-        $candidates += Get-ChildItem -Path $imeDir -Filter '*.log' -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 2
+    # 2) Script-built OOBE context — dsregcmd, registry, event logs, network.
+    Write-Host "  Building oobe-context.txt (dsregcmd + registry + event logs)…" -ForegroundColor Gray
+    $contextPath = Build-BiitOobeContextFile -Serial $serial
+    if ($contextPath -and (Test-Path $contextPath)) {
+        $candidates += (Get-Item $contextPath)
     }
 
-    # 3) Script transcripts.
+    # 3) IME logs — newest 1 (not 2; oobe-context.txt now consumes a slot).
+    $imeDir = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs"
+    if (Test-Path $imeDir) {
+        $candidates += Get-ChildItem -Path $imeDir -Filter '*.log' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    }
+
+    # 4 + 5) Script transcripts — newest EnrollmentScript + newest PS-*.log.
     $tempDir = 'C:\Windows\Temp'
     if (Test-Path $tempDir) {
-        $candidates += Get-ChildItem -Path $tempDir -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like 'PS-*.log' -or $_.Name -like 'EnrollmentScript - *.log' } |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 2
+        $enrollLog = Get-ChildItem -Path $tempDir -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'EnrollmentScript - *.log' } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($enrollLog) { $candidates += $enrollLog }
+        $psLog = Get-ChildItem -Path $tempDir -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'PS-*.log' } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($psLog) { $candidates += $psLog }
     }
 
     if (-not $candidates -or $candidates.Count -eq 0) {
@@ -2650,8 +2793,10 @@ Function Invoke-BiitDiagnosticsCapture {
     }
 
     # Cap the file count so the backend's per-request limit is never exceeded.
+    # Order matters — earlier entries are higher-priority (CAB + oobe-context
+    # are the two we never want to drop).
     if ($candidates.Count -gt $MaxFilesPerRequest) {
-        Write-Host "  Captured $($candidates.Count) files; trimming to the $MaxFilesPerRequest most recent for upload." -ForegroundColor Yellow
+        Write-Host "  Captured $($candidates.Count) files; trimming to the $MaxFilesPerRequest highest-priority for upload." -ForegroundColor Yellow
         $candidates = $candidates | Select-Object -First $MaxFilesPerRequest
     }
 
