@@ -2987,19 +2987,48 @@ Function Invoke-BiitDiagnosticsCapture {
         }
     }
 
+    # PRP-63 — emit BOTH a base64 payload (legacy /diagnostics-by-code path
+    # for paths 2/3 + the legacy code-driven base64 fallback) AND a path
+    # manifest for the presigned-PUT path used by option [6] sub-path 1.
+    # The presigned path streams files directly to S3 via Invoke-WebRequest
+    # -InFile, bypassing API Gateway's 10 MB request cap. When a candidate
+    # exceeds $MaxBytes, the trimmed tail is written to a sibling temp file
+    # so both paths see the SAME bytes — Paths[i].LocalPath always reflects
+    # what would have been base64'd in Files[i].contentBase64.
     $payload = @()
+    $paths   = @()
     foreach ($f in $candidates) {
         try {
             $bytes = _Read-FileShared -Path $f.FullName
+            $localPath = $f.FullName
             if ($bytes.Length -gt $MaxBytes) {
                 Write-Host "  '$($f.Name)' is $([Math]::Round($bytes.Length / 1MB, 2)) MB — trimming to last $([Math]::Round($MaxBytes / 1MB, 2)) MB." -ForegroundColor Yellow
                 $tail = New-Object byte[] $MaxBytes
                 [System.Array]::Copy($bytes, $bytes.Length - $MaxBytes, $tail, 0, $MaxBytes)
                 $bytes = $tail
+                # Write trimmed tail to a sibling temp file so the presigned
+                # PUT path can stream the SAME bytes that the base64 payload
+                # encodes. Suffixed `.tail` so it's obvious in C:\Windows\Temp.
+                $localPath = Join-Path $env:TEMP ("oobe-diag-tail-" + $f.Name + ".tail")
+                [System.IO.File]::WriteAllBytes($localPath, $bytes)
             }
             $payload += @{
                 filename      = $f.Name
                 contentBase64 = [System.Convert]::ToBase64String($bytes)
+            }
+            $paths += @{
+                filename    = $f.Name
+                localPath   = $localPath
+                sizeBytes   = [int64]$bytes.Length
+                contentType = switch -Regex ($f.Name) {
+                    '\.cab$'   { 'application/vnd.ms-cab-compressed'; break }
+                    '\.zip$'   { 'application/zip'; break }
+                    '\.evtx$'  { 'application/octet-stream'; break }
+                    '\.etl$'   { 'application/octet-stream'; break }
+                    '\.json$'  { 'application/json'; break }
+                    '\.xml$'   { 'application/xml'; break }
+                    default    { 'text/plain' }
+                }
             }
             Write-Host "  + $($f.Name) ($([Math]::Round($bytes.Length / 1KB, 1)) KB)"
         } catch {
@@ -3015,8 +3044,131 @@ Function Invoke-BiitDiagnosticsCapture {
     Write-Host "  Local CAB preserved at: $cabPath" -ForegroundColor Gray
     return @{
         Files  = $payload
+        Paths  = $paths
         CabPath = $cabPath
         Serial = $serial
+    }
+}
+
+
+Function Submit-BiitDiagnosticsPresigned {
+    <#
+    PRP-63 — Submit a captured diagnostics bundle via the presigned-PUT
+    flow. Three steps:
+
+      1. POST manifest to /diagnostics-by-code/presign — returns presigned
+         PUT URLs + a session nonce.
+      2. PUT each file directly to S3 via Invoke-WebRequest -InFile.
+         Bypasses API Gateway's 10 MB body cap entirely.
+      3. POST attachment list to /diagnostics-by-code/finalize — Lambda
+         head_objects each upload + stamps the deployment-row sentinel
+         + emits the same audit/activity event the legacy path produces.
+
+    Returns @{Success=[bool]; Count=[int]; Error=[string]}.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $PortalApiBase,
+        [Parameter(Mandatory)] [string] $Code,
+        [Parameter(Mandatory)] [object[]] $PathManifest
+    )
+
+    # Step 1 — presign
+    $presignBody = @{
+        code  = $Code
+        files = @($PathManifest | ForEach-Object {
+            @{
+                filename    = $_.filename
+                size        = [int64]$_.sizeBytes
+                contentType = $_.contentType
+            }
+        })
+    } | ConvertTo-Json -Compress -Depth 6
+
+    Write-Host "  Step 1/3: requesting presigned upload URLs…" -ForegroundColor Gray
+    try {
+        $presignResp = Invoke-RestMethod -Method POST `
+            -Uri "$PortalApiBase/immy/autopilot/diagnostics-by-code/presign" `
+            -ContentType "application/json" `
+            -Body $presignBody `
+            -TimeoutSec 30 -DisableKeepAlive
+    } catch {
+        return @{ Success = $false; Count = 0; Error = "presign failed: $_" }
+    }
+
+    $sessionId    = $presignResp.sessionId
+    $deploymentId = $presignResp.deploymentId
+    $uploads      = @($presignResp.uploads)
+    if (-not $sessionId -or -not $deploymentId -or $uploads.Count -ne $PathManifest.Count) {
+        return @{ Success = $false; Count = 0; Error = "presign returned an unexpected shape" }
+    }
+
+    # Step 2 — direct PUT each file to S3
+    Write-Host "  Step 2/3: streaming $($uploads.Count) file(s) to S3…" -ForegroundColor Gray
+    $attachments = @()
+    for ($i = 0; $i -lt $uploads.Count; $i++) {
+        $upload = $uploads[$i]
+        $manifest = $PathManifest | Where-Object { $_.filename -eq $upload.filename } | Select-Object -First 1
+        if (-not $manifest) {
+            return @{ Success = $false; Count = 0; Error = "presign returned filename $($upload.filename) not in manifest" }
+        }
+
+        # Convert PSCustomObject .headers to a string-keyed hashtable so
+        # Invoke-WebRequest doesn't choke on dynamic property access. The
+        # presign payload signs Content-Type into the URL, so we MUST send
+        # the exact value back. Pull Content-Type out of $putHeaders and
+        # pass it via -ContentType; passing it in both -Headers and
+        # -ContentType produces a "header already set" warning on PS 5.1.
+        $putHeaders = @{}
+        $putContentType = 'application/octet-stream'
+        $upload.headers.PSObject.Properties | ForEach-Object {
+            if ($_.Name -ieq 'Content-Type') {
+                $putContentType = [string]$_.Value
+            } else {
+                $putHeaders[$_.Name] = [string]$_.Value
+            }
+        }
+
+        try {
+            Invoke-WebRequest -Method Put `
+                -Uri $upload.url `
+                -InFile $manifest.localPath `
+                -Headers $putHeaders `
+                -ContentType $putContentType `
+                -UseBasicParsing -TimeoutSec 300 -DisableKeepAlive | Out-Null
+        } catch {
+            return @{ Success = $false; Count = 0; Error = "S3 PUT failed for $($upload.filename): $_" }
+        }
+
+        $attachments += @{
+            filename = $upload.filename
+            s3Key    = $upload.key
+            size     = [int64]$manifest.sizeBytes
+        }
+        Write-Host "    + $($upload.filename) uploaded" -ForegroundColor Gray
+    }
+
+    # Step 3 — finalize
+    $finalizeBody = @{
+        sessionId    = $sessionId
+        deploymentId = $deploymentId
+        attachments  = @($attachments)
+    } | ConvertTo-Json -Compress -Depth 6
+
+    Write-Host "  Step 3/3: finalizing…" -ForegroundColor Gray
+    try {
+        $finalResp = Invoke-RestMethod -Method POST `
+            -Uri "$PortalApiBase/immy/autopilot/diagnostics-by-code/finalize" `
+            -ContentType "application/json" `
+            -Body $finalizeBody `
+            -TimeoutSec 60 -DisableKeepAlive
+    } catch {
+        return @{ Success = $false; Count = 0; Error = "finalize failed: $_" }
+    }
+
+    return @{
+        Success = $true
+        Count   = [int]($finalResp.count)
+        Error   = $null
     }
 }
 
@@ -3064,9 +3216,15 @@ Function Invoke-BiitDiagnosticsUpload {
         return
     }
 
-    $captured = Invoke-BiitDiagnosticsCapture
+    # Path 1 uses the PRP-63 presigned-PUT route (50 MB / file). Paths 2 + 3
+    # bundle into intake routes that still go through API GW's 10 MB body
+    # cap, so they call the capture function with the legacy 10 MB tail-trim
+    # below by passing -MaxBytes explicitly.
+    $captureMaxBytes = if ($sub -eq "1") { 52428800 } else { 10485760 }
+    $captured = Invoke-BiitDiagnosticsCapture -MaxBytes $captureMaxBytes
     if (-not $captured) { return }
     $files  = $captured.Files
+    $paths  = $captured.Paths
     $serial = $captured.Serial
     $cab    = $captured.CabPath
 
@@ -3105,31 +3263,26 @@ Function Invoke-BiitDiagnosticsUpload {
     }
 
     if ($sub -eq "1") {
-        # Path (a) — canonical, code-driven, /diagnostics-by-code.
+        # Path (a) — canonical, code-driven. PRP-63 — uses the presigned-PUT
+        # flow (presign → direct S3 PUT → finalize) to bypass API Gateway's
+        # 10 MB request body cap. Real OOBE captures routinely exceed that
+        # via a 12 MB IntuneManagementExtension.log alone.
         $code = Read-Host "`nEnter the 6-digit upload code from the portal wizard"
         $code = $code.Trim()
         if ($code -notmatch '^\d{6}$') {
             Write-Host "Code must be 6 digits." -ForegroundColor Red
             return
         }
-        $body = @{
-            code  = $code
-            files = $files
-        } | ConvertTo-Json -Compress -Depth 6
 
-        try {
-            Write-Host "`nUploading to portal (60s timeout)…" -ForegroundColor Gray
-            $resp = Invoke-RestMethod -Method POST `
-                -Uri "$PortalApiBase/immy/autopilot/diagnostics-by-code" `
-                -ContentType "application/json" `
-                -Body $body `
-                -TimeoutSec 60 -DisableKeepAlive
+        Write-Host "`nUploading $($paths.Count) file(s) via presigned S3 PUT…" -ForegroundColor Gray
+        $result = Submit-BiitDiagnosticsPresigned -PortalApiBase $PortalApiBase -Code $code -PathManifest $paths
+        if ($result.Success) {
             Write-Host "`nUploaded." -ForegroundColor Green
-            Write-Host "  Files attached: $($resp.count)"
-        } catch {
-            Write-Host "Upload failed: $_" -ForegroundColor Red
+            Write-Host "  Files attached: $($result.Count)"
+        } else {
+            Write-Host "Upload failed: $($result.Error)" -ForegroundColor Red
             Write-Host "Local CAB preserved at: $cab" -ForegroundColor Yellow
-            Write-Host "(Codes are single-use unless the wizard minted a multi-use code.)" -ForegroundColor Yellow
+            Write-Host "(Codes have 5 redemptions — generate a fresh one if this code is exhausted.)" -ForegroundColor Yellow
         }
         return
     }
