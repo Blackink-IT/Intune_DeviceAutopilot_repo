@@ -2577,6 +2577,357 @@ Function Invoke-BiitPortalUpload() {
 }
 #EndRegion - BIIT MSP Portal upload
 
+#Region - BIIT MSP Portal diagnostic upload (PRP-57 Phase C)
+Function Invoke-BiitDiagnosticsCapture {
+    <#
+    Captures Autopilot + Intune-side diagnostic logs into base64-encoded
+    blobs ready to POST. Returns an array of @{filename; contentBase64}
+    hashtables (or $null on hard failure).
+
+    Sources:
+      1. MdmDiagnosticsTool.exe -area Autopilot;DeviceProvisioning -cab ...
+         Microsoft's canonical Autopilot diag tool — bundles the relevant
+         registry hives + log files into a single CAB.
+      2. C:\ProgramData\Microsoft\IntuneManagementExtension\Logs\*.log
+         IME side (Win32 app installs, sidecar agent activity).
+      3. C:\Windows\Temp\PS-*.log + C:\Windows\Temp\EnrollmentScript - *.log
+         This script's own transcript (line 2 of the script).
+
+    Each file is capped at $MaxBytes (default 10 MB) before encoding;
+    files larger than the cap are tail-truncated to the last $MaxBytes
+    bytes so we keep the most recent activity, with a warning surfaced
+    to the operator.
+    #>
+    param(
+        [int]$MaxBytes = 10485760,         # 10 MB / file
+        [int]$MaxFilesPerRequest = 5       # backend cap; mirrored client-side
+    )
+
+    $serial = $null
+    try { $serial = (Get-CimInstance -Class Win32_BIOS -ErrorAction Stop).SerialNumber.Trim() } catch { $serial = "unknown" }
+    $cabPath = "C:\Windows\Temp\autopilot-diag-$serial.cab"
+
+    Write-Host "`nCapturing diagnostics — this can take 30-60 seconds…" -ForegroundColor Gray
+
+    # 1) MdmDiagnosticsTool — produces the CAB. Always attempt; the tool
+    # writes a non-zero exit code if the device has never started enrollment,
+    # but the CAB usually still contains useful registry exports.
+    try {
+        if (Test-Path $cabPath) { Remove-Item $cabPath -Force -ErrorAction SilentlyContinue }
+        $proc = Start-Process -FilePath "$env:windir\System32\MdmDiagnosticsTool.exe" `
+            -ArgumentList @('-area','Autopilot;DeviceProvisioning','-cab',$cabPath) `
+            -NoNewWindow -PassThru -Wait -ErrorAction Stop
+        if ($proc.ExitCode -ne 0) {
+            Write-Host "  MdmDiagnosticsTool exit code $($proc.ExitCode) — continuing with whatever it produced." -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "  MdmDiagnosticsTool failed: $_" -ForegroundColor Yellow
+        # Continue — we still have IME + script logs.
+    }
+
+    $candidates = @()
+    if (Test-Path $cabPath) { $candidates += (Get-Item $cabPath) }
+
+    # 2) IME logs.
+    $imeDir = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs"
+    if (Test-Path $imeDir) {
+        # Newest first — the failure signal is usually in the most recent log.
+        $candidates += Get-ChildItem -Path $imeDir -Filter '*.log' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 2
+    }
+
+    # 3) Script transcripts.
+    $tempDir = 'C:\Windows\Temp'
+    if (Test-Path $tempDir) {
+        $candidates += Get-ChildItem -Path $tempDir -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'PS-*.log' -or $_.Name -like 'EnrollmentScript - *.log' } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 2
+    }
+
+    if (-not $candidates -or $candidates.Count -eq 0) {
+        Write-Host "  No diagnostic files found to upload." -ForegroundColor Red
+        return $null
+    }
+
+    # Cap the file count so the backend's per-request limit is never exceeded.
+    if ($candidates.Count -gt $MaxFilesPerRequest) {
+        Write-Host "  Captured $($candidates.Count) files; trimming to the $MaxFilesPerRequest most recent for upload." -ForegroundColor Yellow
+        $candidates = $candidates | Select-Object -First $MaxFilesPerRequest
+    }
+
+    $payload = @()
+    foreach ($f in $candidates) {
+        try {
+            $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
+            if ($bytes.Length -gt $MaxBytes) {
+                Write-Host "  '$($f.Name)' is $([Math]::Round($bytes.Length / 1MB, 2)) MB — trimming to last $([Math]::Round($MaxBytes / 1MB, 2)) MB." -ForegroundColor Yellow
+                $tail = New-Object byte[] $MaxBytes
+                [System.Array]::Copy($bytes, $bytes.Length - $MaxBytes, $tail, 0, $MaxBytes)
+                $bytes = $tail
+            }
+            $payload += @{
+                filename      = $f.Name
+                contentBase64 = [System.Convert]::ToBase64String($bytes)
+            }
+            Write-Host "  + $($f.Name) ($([Math]::Round($bytes.Length / 1KB, 1)) KB)"
+        } catch {
+            Write-Host "  Skipping '$($f.Name)' — read error: $_" -ForegroundColor Yellow
+        }
+    }
+
+    if ($payload.Count -eq 0) {
+        Write-Host "  All capture targets failed to read." -ForegroundColor Red
+        return $null
+    }
+
+    Write-Host "  Local CAB preserved at: $cabPath" -ForegroundColor Gray
+    return @{
+        Files  = $payload
+        CabPath = $cabPath
+        Serial = $serial
+    }
+}
+
+
+Function Invoke-BiitDiagnosticsUpload {
+    <#
+    Option [6] — capture + upload diagnostic logs to BIIT MSP Portal.
+    Three sub-paths covering the post-failure (canonical) and bundle-with-intake
+    (Path 1 / Path 2) cases. PRP-57 Phase C.
+
+    Path (a) — code-driven post-failure: tech gets a 6-digit code from the
+    wizard's "Generate upload code" button. Calls /diagnostics-by-code (UNAUTH
+    at API GW; code is the auth). The canonical and most common path.
+
+    Path (b) — bundle into a Path 2 intake: same OOBE session that just
+    uploaded via option [5] path 2 wants to add diagnostics. Re-call
+    /intake-by-code with the same (multi-use) or a fresh code, plus the
+    diagnostics body field.
+
+    Path (c) — bundle into a Path 1 intake: BIIT-tenant MSAL flow + diagnostics
+    body. Calls /intake-from-script.
+
+    If the OOBE device is offline (no portal connectivity), the local CAB
+    at C:\Windows\Temp\autopilot-diag-{serial}.cab survives; the tech can
+    grab it via USB and upload via the portal drag-drop later.
+    #>
+    $PortalApiBase = "https://2xo4m98krh.execute-api.us-east-2.amazonaws.com/prod"
+    $BiitTenantId                = "fdec8e68-1a98-4a07-96ca-61d6960dd020"
+    $BiitAutopilotIntakeClientId = "9446f70b-ad62-4bcb-aa07-7bc58fecc2f9"
+    $BiitAutopilotIntakeScope    = "api://d0e751e8-fac8-429c-98a5-53939e92f535/Autopilot.Intake"
+
+    Write-Host "`n--- BIIT MSP Portal Diagnostics Upload ---" -ForegroundColor Cyan
+    Write-Host "[1] Use a 6-digit upload code from the portal wizard (recommended)"
+    Write-Host "[2] Bundle with a fresh Path 2 intake (6-digit code)"
+    Write-Host "[3] Bundle with a Path 1 intake (BIIT sign-in)"
+    Write-Host "[4] Capture only — leave the CAB on disk, skip upload"
+    Write-Host "[5] Cancel"
+    $sub = Read-Host "`nSelect an option"
+    if ($sub -eq "5" -or [string]::IsNullOrWhiteSpace($sub)) {
+        Write-Host "Cancelled." -ForegroundColor Yellow
+        return
+    }
+    if ($sub -notin @("1","2","3","4")) {
+        Write-Host "Invalid selection." -ForegroundColor Red
+        return
+    }
+
+    $captured = Invoke-BiitDiagnosticsCapture
+    if (-not $captured) { return }
+    $files  = $captured.Files
+    $serial = $captured.Serial
+    $cab    = $captured.CabPath
+
+    if ($sub -eq "4") {
+        Write-Host "`nDiagnostic CAB available at: $cab" -ForegroundColor Green
+        Write-Host "Copy it via USB and use the portal's drag-drop on the failure recovery wizard."
+        return
+    }
+
+    # Paths 2 + 3 need a hardware hash + model + device type for the intake row.
+    $hardwareHash = $null
+    $model        = $null
+    $deviceType   = "Laptop"
+    if ($sub -in @("2","3")) {
+        try {
+            $devDetail = Get-CimInstance -Namespace root/cimv2/mdm/dmmap `
+                -Class MDM_DevDetail_Ext01 `
+                -Filter "InstanceID='Ext' AND ParentID='./DevDetail'" `
+                -ErrorAction Stop
+            $hardwareHash = $devDetail.DeviceHardwareData
+        } catch {
+            Write-Host "Hash capture failed via WMI: $_" -ForegroundColor Red
+            Write-Host "Falling back to path [1] — please mint an upload code from the portal wizard." -ForegroundColor Yellow
+            $sub = "1"
+        }
+        if ($sub -in @("2","3")) {
+            $cs = Get-CimInstance -Class Win32_ComputerSystem
+            $model = $cs.Model.Trim()
+            $deviceType = switch ($cs.PCSystemType) {
+                1 { "Desktop" }
+                2 { "Laptop" }
+                3 { "Workstation" }
+                default { "Laptop" }
+            }
+        }
+    }
+
+    if ($sub -eq "1") {
+        # Path (a) — canonical, code-driven, /diagnostics-by-code.
+        $code = Read-Host "`nEnter the 6-digit upload code from the portal wizard"
+        $code = $code.Trim()
+        if ($code -notmatch '^\d{6}$') {
+            Write-Host "Code must be 6 digits." -ForegroundColor Red
+            return
+        }
+        $body = @{
+            code  = $code
+            files = $files
+        } | ConvertTo-Json -Compress -Depth 6
+
+        try {
+            Write-Host "`nUploading to portal (60s timeout)…" -ForegroundColor Gray
+            $resp = Invoke-RestMethod -Method POST `
+                -Uri "$PortalApiBase/immy/autopilot/diagnostics-by-code" `
+                -ContentType "application/json" `
+                -Body $body `
+                -TimeoutSec 60 -DisableKeepAlive
+            Write-Host "`nUploaded." -ForegroundColor Green
+            Write-Host "  Files attached: $($resp.count)"
+        } catch {
+            Write-Host "Upload failed: $_" -ForegroundColor Red
+            Write-Host "Local CAB preserved at: $cab" -ForegroundColor Yellow
+            Write-Host "(Codes are single-use unless the wizard minted a multi-use code.)" -ForegroundColor Yellow
+        }
+        return
+    }
+
+    if ($sub -eq "2") {
+        # Path (b) — bundle into Path 2 intake.
+        $code = Read-Host "`nEnter the 6-digit intake code the BIIT tech gave you"
+        $code = $code.Trim()
+        if ($code -notmatch '^\d{6}$') {
+            Write-Host "Code must be 6 digits." -ForegroundColor Red
+            return
+        }
+        $redeemerName = $null
+        $maybeName = Read-Host "`nYour name (required for multi-use codes; leave blank for single-use)"
+        $maybeName = ($maybeName -as [string]).Trim()
+        if ($maybeName) { $redeemerName = $maybeName }
+
+        $body = @{
+            code         = $code
+            hardwareHash = $hardwareHash
+            serialNumber = $serial
+            model        = $model
+            deviceType   = $deviceType
+            diagnostics  = $files
+        }
+        if ($redeemerName) { $body.redeemedByName = $redeemerName }
+        $bodyJson = $body | ConvertTo-Json -Compress -Depth 6
+
+        try {
+            Write-Host "`nUploading to portal (60s timeout)…" -ForegroundColor Gray
+            $resp = Invoke-RestMethod -Method POST `
+                -Uri "$PortalApiBase/immy/autopilot/intake-by-code" `
+                -ContentType "application/json" `
+                -Body $bodyJson `
+                -TimeoutSec 60 -DisableKeepAlive
+            Write-Host "`nUploaded." -ForegroundColor Green
+            Write-Host "  Intake ID:           $($resp.intakeId)"
+            Write-Host "  Diagnostics attached: $($resp.diagnosticsAttached)"
+        } catch {
+            Write-Host "Upload failed: $_" -ForegroundColor Red
+            Write-Host "Local CAB preserved at: $cab" -ForegroundColor Yellow
+        }
+        return
+    }
+
+    if ($sub -eq "3") {
+        # Path (c) — bundle into Path 1 intake. Uses the cached BIIT token
+        # from option [5] if still valid; otherwise prompts for MSAL.
+        $token = $null
+        if ($script:BiitIntakeToken -and $script:BiitIntakeTokenExpiresAt -and `
+            $script:BiitIntakeTokenExpiresAt -gt (Get-Date).AddMinutes(2)) {
+            $token = $script:BiitIntakeToken
+        }
+        if (-not $token) {
+            if (-not (Get-Module -ListAvailable -Name MSAL.PS)) {
+                Write-Host "MSAL.PS not installed — run option [5] path [1] once first to bootstrap it, or use path [1] (upload code) instead." -ForegroundColor Red
+                return
+            }
+            Import-Module MSAL.PS -ErrorAction Stop
+            try {
+                $msalToken = Get-MsalToken -ClientId $BiitAutopilotIntakeClientId `
+                                           -TenantId $BiitTenantId `
+                                           -Scopes  $BiitAutopilotIntakeScope `
+                                           -Interactive -ErrorAction Stop
+                $token = $msalToken.AccessToken
+                $script:BiitIntakeToken          = $token
+                $script:BiitIntakeTokenExpiresAt = $msalToken.ExpiresOn.LocalDateTime
+            } catch {
+                Write-Host "Could not acquire BIIT token: $_" -ForegroundColor Red
+                return
+            }
+        }
+
+        # Pick a tenant from the portal's tenant list.
+        Write-Host "`nFetching BIIT tenant list…" -ForegroundColor Gray
+        try {
+            $tenantsResp = Invoke-RestMethod -Method GET `
+                -Uri "$PortalApiBase/immy/autopilot/intake-from-script/tenants" `
+                -Headers @{ Authorization = "Bearer $token" } `
+                -TimeoutSec 30 -DisableKeepAlive
+        } catch {
+            Write-Host "Could not fetch tenant list: $_" -ForegroundColor Red
+            return
+        }
+        $tenants = @($tenantsResp.tenants)
+        if ($tenants.Count -eq 0) {
+            Write-Host "No tenants returned from portal." -ForegroundColor Red
+            return
+        }
+        Write-Host ""
+        for ($i = 0; $i -lt $tenants.Count; $i++) {
+            Write-Host ("  [{0,2}] {1} ({2})" -f ($i+1), $tenants[$i].displayName, $tenants[$i].clientIdentifier)
+        }
+        $choice = Read-Host "`nSelect tenant (number)"
+        $idx = ($choice -as [int]) - 1
+        if ($idx -lt 0 -or $idx -ge $tenants.Count) {
+            Write-Host "Invalid selection." -ForegroundColor Red
+            return
+        }
+        $clientIdentifier = $tenants[$idx].clientIdentifier
+
+        $body = @{
+            clientIdentifier = $clientIdentifier
+            hardwareHash     = $hardwareHash
+            serialNumber     = $serial
+            model            = $model
+            deviceType       = $deviceType
+            diagnostics      = $files
+        } | ConvertTo-Json -Compress -Depth 6
+
+        try {
+            Write-Host "`nUploading to portal (60s timeout)…" -ForegroundColor Gray
+            $resp = Invoke-RestMethod -Method POST `
+                -Uri "$PortalApiBase/immy/autopilot/intake-from-script" `
+                -Headers @{ Authorization = "Bearer $token" } `
+                -ContentType "application/json" `
+                -Body $body `
+                -TimeoutSec 60 -DisableKeepAlive
+            Write-Host "`nUploaded." -ForegroundColor Green
+            Write-Host "  Intake ID:            $($resp.intakeId)"
+            Write-Host "  Diagnostics attached:  $($resp.diagnosticsAttached)"
+        } catch {
+            Write-Host "Upload failed: $_" -ForegroundColor Red
+            Write-Host "Local CAB preserved at: $cab" -ForegroundColor Yellow
+        }
+        return
+    }
+}
+#EndRegion - BIIT MSP Portal diagnostic upload
+
 #Region - Menu
 do {
     do {
@@ -2590,6 +2941,7 @@ do {
 [3] Get devices deployment status | Useful for getting the ID's of apps a deployment is hung on
 [4] Update windows | Use this if it's a brand new computer and you sense there will be updates to install. Run BEFORE you enroll the device in Intune
 [5] Upload this device to the BIIT MSP Portal | Sends hash + serial to the Portal's Autopilot intake queue for a tech to finish
+[6] Capture and upload diagnostics | Bundle Autopilot/IME/EnrollmentScript logs and ship them to the portal for a tech to triage
 
 [0] Exit Script
 -----
@@ -2640,8 +2992,9 @@ do {
             }
             4 { UpdateWindows }
             5 { Invoke-BiitPortalUpload }
+            6 { Invoke-BiitDiagnosticsUpload }
             0 { Stop-Transcript;exit }
         }
-    }  while($userAction -notmatch "[123450]")
+    }  while($userAction -notmatch "[1234560]")
 } until($userAction -eq "0")
 #EndRegion - Menu
