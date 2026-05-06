@@ -2800,10 +2800,41 @@ Function Invoke-BiitDiagnosticsCapture {
         $candidates = $candidates | Select-Object -First $MaxFilesPerRequest
     }
 
+    # Read with FileShare.ReadWrite — the script's own EnrollmentScript-*.log
+    # is held open by Start-Transcript at the top of this script. The default
+    # [System.IO.File]::ReadAllBytes() uses FileShare.Read which collides with
+    # Start-Transcript's writer and 502s every option [6] upload of the active
+    # transcript ("file is in use by another process"). FileShare.ReadWrite
+    # cooperates; same fix applies to any IME / Provisioning log that the OS
+    # may still be appending to during OOBE.
+    function _Read-FileShared {
+        param([string]$Path)
+        $fs = $null
+        try {
+            $fs = [System.IO.File]::Open(
+                $Path,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::ReadWrite
+            )
+            $len = $fs.Length
+            $buf = New-Object byte[] $len
+            $offset = 0
+            while ($offset -lt $len) {
+                $read = $fs.Read($buf, $offset, $len - $offset)
+                if ($read -le 0) { break }
+                $offset += $read
+            }
+            return $buf
+        } finally {
+            if ($fs) { $fs.Dispose() }
+        }
+    }
+
     $payload = @()
     foreach ($f in $candidates) {
         try {
-            $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
+            $bytes = _Read-FileShared -Path $f.FullName
             if ($bytes.Length -gt $MaxBytes) {
                 Write-Host "  '$($f.Name)' is $([Math]::Round($bytes.Length / 1MB, 2)) MB — trimming to last $([Math]::Round($MaxBytes / 1MB, 2)) MB." -ForegroundColor Yellow
                 $tail = New-Object byte[] $MaxBytes
