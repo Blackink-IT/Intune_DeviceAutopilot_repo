@@ -2706,6 +2706,155 @@ Function Build-BiitOobeContextFile {
     }
 }
 
+Function Build-BiitTempLogsZip {
+    <#
+    Bundles every PowerShell / Win32-deploy log file from C:\Windows\Temp
+    into a single ZIP at C:\Windows\Temp\oobe-temp-logs-{serial}.zip.
+
+    Why a ZIP: many Win32 apps land their script transcripts in
+    C:\Windows\Temp under varying name patterns — `PS-*.log` (the
+    PowerShell engine's own transcript), `PS_*.log` and
+    `PSAppDeployToolkit_*.log` (PSAppDeployToolkit pattern), `Install-*.log`
+    / `Uninstall-*.log` / `Detection-*.log` (custom installer scripts),
+    plus this script's own `EnrollmentScript - *.log`. With a 5-file
+    upload cap on the backend, picking ONE per pattern means you miss
+    everything else; bundling them all into a single .zip gives the tech
+    every relevant transcript in one upload slot.
+
+    Per-file tail-trim at 5 MB (so a single bloated app log doesn't
+    dominate the archive). All reads use FileShare.ReadWrite (the active
+    EnrollmentScript transcript is held open by Start-Transcript at the
+    top of this script).
+
+    Excludes the CAB + oobe-context.txt + the zip itself (we don't want
+    to re-zip our own output).
+
+    Returns the ZIP file path on success, $null if no logs were found
+    or the ZIP creation hard-failed. Empty ZIPs are skipped.
+    #>
+    param(
+        [string]$Serial,
+        [int]$PerFileMaxBytes = 5242880   # 5 MB per file inside the ZIP
+    )
+
+    $tempDir = 'C:\Windows\Temp'
+    if (-not (Test-Path $tempDir)) { return $null }
+
+    $zipPath = Join-Path $tempDir "oobe-temp-logs-$Serial.zip"
+    if (Test-Path $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
+
+    # Glob patterns to bundle. Order doesn't matter — we sort by
+    # LastWriteTime DESC and bundle the most recent N candidates total.
+    $patterns = @(
+        'PS-*.log',                       # PowerShell engine transcripts
+        'PS_*.log',                       # PSAppDeployToolkit-style
+        'PSAppDeployToolkit*.log',        # Newer PSADT versions
+        'EnrollmentScript - *.log',       # This script's transcripts
+        'Install-*.log',                  # Custom Win32 install scripts
+        'Uninstall-*.log',                # Custom Win32 uninstall scripts
+        'Detection-*.log',                # Custom Win32 detection scripts
+        'ImmyBot-*.log',                  # ImmyBot agent install
+        'IntuneAgentScript*.log',         # Intune agent script logs
+        'BiitDiagnostics*.log',           # Anything BIIT-flavored
+        '*.cmd.log',                      # SCCM/MDT-style cmd transcripts
+        '*-install.log',                  # Generic installer pattern
+        'msi*.log',                       # MSI verbose logs
+        'setup*.log'                      # Generic setup logs
+    )
+
+    $exclude = @(
+        "autopilot-diag-$Serial.cab",
+        "oobe-context-$Serial.txt",
+        "oobe-temp-logs-$Serial.zip"
+    )
+
+    $files = @()
+    foreach ($pat in $patterns) {
+        $hits = Get-ChildItem -Path $tempDir -Filter $pat -ErrorAction SilentlyContinue |
+                Where-Object { $exclude -notcontains $_.Name }
+        if ($hits) { $files += $hits }
+    }
+
+    # De-duplicate by FullName (a file matching two glob patterns shouldn't
+    # appear twice) and sort newest-first; cap at 25 to bound ZIP size.
+    $files = $files | Sort-Object FullName -Unique | Sort-Object LastWriteTime -Descending | Select-Object -First 25
+
+    if (-not $files -or $files.Count -eq 0) {
+        Write-Host "  No PowerShell/Win32-deploy logs in C:\Windows\Temp to bundle." -ForegroundColor Gray
+        return $null
+    }
+
+    # Use System.IO.Compression directly so we can feed byte arrays from
+    # FileShare.ReadWrite reads — Compress-Archive opens with restrictive
+    # sharing and trips over Start-Transcript's active log.
+    try {
+        Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    } catch { }
+
+    $fs = $null
+    $archive = $null
+    $bundled = 0
+    try {
+        $fs = [System.IO.File]::Open($zipPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $archive = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Create)
+
+        foreach ($f in $files) {
+            try {
+                # Read with FileShare.ReadWrite so an in-progress transcript
+                # writer (or in-progress IME install) doesn't block the read.
+                $rs = [System.IO.File]::Open(
+                    $f.FullName,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read,
+                    [System.IO.FileShare]::ReadWrite
+                )
+                $bytes = $null
+                try {
+                    $len = $rs.Length
+                    $buf = New-Object byte[] $len
+                    $offset = 0
+                    while ($offset -lt $len) {
+                        $read = $rs.Read($buf, $offset, $len - $offset)
+                        if ($read -le 0) { break }
+                        $offset += $read
+                    }
+                    $bytes = $buf
+                } finally { $rs.Dispose() }
+
+                if ($bytes.Length -gt $PerFileMaxBytes) {
+                    Write-Host "  ZIP: '$($f.Name)' is $([Math]::Round($bytes.Length / 1MB, 2)) MB — tail-trimming to $([Math]::Round($PerFileMaxBytes / 1MB, 2)) MB." -ForegroundColor Gray
+                    $tail = New-Object byte[] $PerFileMaxBytes
+                    [System.Array]::Copy($bytes, $bytes.Length - $PerFileMaxBytes, $tail, 0, $PerFileMaxBytes)
+                    $bytes = $tail
+                }
+
+                $entry = $archive.CreateEntry($f.Name, [System.IO.Compression.CompressionLevel]::Optimal)
+                $estream = $entry.Open()
+                try {
+                    $estream.Write($bytes, 0, $bytes.Length)
+                } finally { $estream.Close() }
+                $bundled++
+            } catch {
+                Write-Host "  ZIP: skipped '$($f.Name)' — $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+    } catch {
+        Write-Host "  ZIP creation hard-failed: $_" -ForegroundColor Yellow
+        return $null
+    } finally {
+        if ($archive) { $archive.Dispose() }
+        if ($fs)      { $fs.Dispose() }
+    }
+
+    if ($bundled -eq 0) {
+        if (Test-Path $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
+        return $null
+    }
+    Write-Host "  ZIP: bundled $bundled file(s) → $zipPath" -ForegroundColor Gray
+    return $zipPath
+}
+
 Function Invoke-BiitDiagnosticsCapture {
     <#
     Captures Autopilot + Intune-side diagnostic logs into base64-encoded
@@ -2722,8 +2871,16 @@ Function Invoke-BiitDiagnosticsCapture {
          time sync, ipconfig. Designed to make 0x801c03f3-class AAD-join
          failures self-diagnosable from a single file.
       3. Newest IntuneManagementExtension log (Win32 app installs, sidecar).
-      4. Newest EnrollmentScript transcript (this script's own log).
-      5. Newest PS-*.log (PowerShell session transcript).
+      4. oobe-temp-logs-{serial}.zip — bundle of every PowerShell/Win32-
+         deploy script log in C:\Windows\Temp. Up to 25 files matching
+         PS*, EnrollmentScript-*, Install-*, Detection-*, PSAppDeployToolkit*,
+         ImmyBot-*, msi*, setup*, *.cmd.log etc. Per-file tail-trim at
+         5 MB. Resolves the original "newest 1 PS-*.log + newest 1
+         EnrollmentScript-*.log" approach being too narrow — the 5-file
+         backend cap is preserved by collapsing all script logs into one
+         archive slot.
+      5. Spare slot — currently unused, reserved for future per-failure
+         additions (e.g. an Autopilot-specific Event Log dump).
 
     Each file is capped at $MaxBytes (default 10 MB) before encoding;
     files larger than the cap are tail-truncated to the last $MaxBytes
@@ -2774,17 +2931,16 @@ Function Invoke-BiitDiagnosticsCapture {
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
     }
 
-    # 4 + 5) Script transcripts — newest EnrollmentScript + newest PS-*.log.
-    $tempDir = 'C:\Windows\Temp'
-    if (Test-Path $tempDir) {
-        $enrollLog = Get-ChildItem -Path $tempDir -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like 'EnrollmentScript - *.log' } |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        if ($enrollLog) { $candidates += $enrollLog }
-        $psLog = Get-ChildItem -Path $tempDir -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like 'PS-*.log' } |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        if ($psLog) { $candidates += $psLog }
+    # 4) Bundle every PowerShell / Win32-deploy log in C:\Windows\Temp into
+    # a single ZIP so the 5-file cap doesn't force us to pick one pattern
+    # over another. Operator quote 2026-05-06 PM:
+    # "Many of our Win32 apps start with PS. so would it be worth grabbing
+    #  those?" — yes, and Detection-*, Install-*, PSAppDeployToolkit*,
+    # ImmyBot-*, msi*, setup* etc. all land in the same dir.
+    Write-Host "  Bundling C:\Windows\Temp script logs into ZIP…" -ForegroundColor Gray
+    $tempLogsZipPath = Build-BiitTempLogsZip -Serial $serial
+    if ($tempLogsZipPath -and (Test-Path $tempLogsZipPath)) {
+        $candidates += (Get-Item $tempLogsZipPath)
     }
 
     if (-not $candidates -or $candidates.Count -eq 0) {
