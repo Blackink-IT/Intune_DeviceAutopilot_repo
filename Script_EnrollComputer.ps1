@@ -2995,23 +2995,34 @@ Function Invoke-BiitDiagnosticsCapture {
     # exceeds $MaxBytes, the trimmed tail is written to a sibling temp file
     # so both paths see the SAME bytes — Paths[i].LocalPath always reflects
     # what would have been base64'd in Files[i].contentBase64.
+    # IntuneManagementExtension.log is held open with FileShare.Read by the
+    # IME service (rejecting FileShare.None re-opens). `_Read-FileShared`
+    # cooperates by opening with FileShare.ReadWrite — the legacy base64
+    # path was already fine because it reads bytes here and never re-opens
+    # the file. The presigned-PUT path uses `Invoke-WebRequest -InFile`,
+    # which re-opens with default sharing and CRASHES with "process cannot
+    # access the file because it is being used by another process".
+    #
+    # Fix: ALWAYS write a temp copy of the bytes to $env:TEMP, regardless
+    # of trimming. The `Paths[i].localPath` always points at our temp copy
+    # — the original file stays exclusively owned by IME. Caps disk usage
+    # at ~$MaxBytes per file; cleanup happens via $env:TEMP rotation.
     $payload = @()
     $paths   = @()
     foreach ($f in $candidates) {
         try {
             $bytes = _Read-FileShared -Path $f.FullName
-            $localPath = $f.FullName
             if ($bytes.Length -gt $MaxBytes) {
                 Write-Host "  '$($f.Name)' is $([Math]::Round($bytes.Length / 1MB, 2)) MB — trimming to last $([Math]::Round($MaxBytes / 1MB, 2)) MB." -ForegroundColor Yellow
                 $tail = New-Object byte[] $MaxBytes
                 [System.Array]::Copy($bytes, $bytes.Length - $MaxBytes, $tail, 0, $MaxBytes)
                 $bytes = $tail
-                # Write trimmed tail to a sibling temp file so the presigned
-                # PUT path can stream the SAME bytes that the base64 payload
-                # encodes. Suffixed `.tail` so it's obvious in C:\Windows\Temp.
-                $localPath = Join-Path $env:TEMP ("oobe-diag-tail-" + $f.Name + ".tail")
-                [System.IO.File]::WriteAllBytes($localPath, $bytes)
             }
+            # Always stage a temp copy so Invoke-WebRequest -InFile doesn't
+            # collide with whatever process holds the original open. Suffixed
+            # `.upload` so it's obvious in C:\Windows\Temp what's transient.
+            $localPath = Join-Path $env:TEMP ("oobe-diag-upload-" + $f.Name + ".upload")
+            [System.IO.File]::WriteAllBytes($localPath, $bytes)
             $payload += @{
                 filename      = $f.Name
                 contentBase64 = [System.Convert]::ToBase64String($bytes)
