@@ -98,6 +98,94 @@ Function Check-PowerShellModule(){
 }
 #EndRegion - function to install or update powershell modules
 
+#Region - PRP-70 — UCPD pre-configure helper (OOBE-side, before ImmyBot onboarding)
+# PRP-70 (2026-05-07) — Configure the User Choice Protection Driver (UCPD)
+# while the device is still in OOBE under this script's control. Routes
+# around the suppress-reboots constraint that PRP-26 enforces during
+# ImmyBot onboarding sessions: ImmyBot's Configure UCPD task aborts when
+# `$RebootPreference -eq 'Suppress'`, but allowing reboots mid-chain
+# breaks the Autopilot reseal flow (commit 9bb8fa4). UCPD has to be set
+# before ImmyBot ever sees the device.
+#
+# `$Enabled` hardcoded `$false` — matches the existing ImmyBot Configure
+# UCPD deployment's parameter value (operator-confirmed 2026-05-07).
+# No per-tenant override; if a tenant ever needs UCPD enabled, that's a
+# follow-up PRP.
+#
+# De-Immy'd version of the operator's ImmyBot script:
+#   - `Invoke-ImmyCommand{}` wrappers stripped (we ARE on the endpoint).
+#   - `ScheduledTaskShould-Be` replaced with native Get/Disable/Enable
+#     -ScheduledTask cmdlets.
+#   - `Restart-ComputerAndWait` replaced with `Restart-Computer -Force`
+#     (script terminates; OOBE resumes on next boot).
+#   - `Throw "...reboots were suppressed"` removed — in OOBE we always
+#     allow reboots, by construction.
+#
+# Idempotent: if the service is already in the desired state, no reboot
+# is triggered.
+Function Invoke-BiitOobeUcpdConfigure {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [bool]$Enabled
+    )
+
+    Write-Host "`n--- UCPD pre-configuration ---" -ForegroundColor Cyan
+    $Service = Get-Service -Name 'UCPD' -ErrorAction SilentlyContinue
+    if (-not $Service) {
+        Write-Host "[UCPD] Service not present on this Windows build — skipping." -ForegroundColor Yellow
+        return $true
+    }
+
+    $ServiceDesiredState = if ($Enabled) { 'Running' } else { 'Stopped' }
+    $TaskDesiredState    = if ($Enabled) { 'Ready'   } else { 'Disabled' }
+
+    $ServiceInDesiredState = ($Service.Status.ToString() -eq $ServiceDesiredState)
+    $Task = Get-ScheduledTask -TaskName 'UCPD velocity' -ErrorAction SilentlyContinue
+    $TaskInDesiredState = $Task -and ($Task.State.ToString() -eq $TaskDesiredState)
+
+    # Reconcile the scheduled task first — no reboot needed.
+    if ($Task -and -not $TaskInDesiredState) {
+        try {
+            if ($TaskDesiredState -eq 'Disabled') {
+                Disable-ScheduledTask -TaskName 'UCPD velocity' -ErrorAction Stop | Out-Null
+                Write-Host "[UCPD] Scheduled task 'UCPD velocity' -> Disabled" -ForegroundColor Gray
+            } else {
+                Enable-ScheduledTask -TaskName 'UCPD velocity' -ErrorAction Stop | Out-Null
+                Write-Host "[UCPD] Scheduled task 'UCPD velocity' -> Ready" -ForegroundColor Gray
+            }
+        } catch {
+            Write-Host "[UCPD] Scheduled task reconcile failed: $_" -ForegroundColor Yellow
+            # Non-fatal — service-state reconcile below is the load-bearing piece.
+        }
+    }
+
+    if ($ServiceInDesiredState) {
+        Write-Host "[UCPD] Service already $ServiceDesiredState — no reboot needed." -ForegroundColor Green
+        return $true
+    }
+
+    # Service config requires sc.exe and a reboot to take effect.
+    $startMode = if ($Enabled) { 'system' } else { 'disabled' }
+    Write-Host "[UCPD] Configuring service start mode -> $startMode (reboot required)" -ForegroundColor Yellow
+    Start-Process 'sc.exe' -ArgumentList "config UCPD start= $startMode" -Wait -NoNewWindow
+
+    # 30-second visible warning per PRP-70 §"Locked-in answers" item 3a.
+    # Single static message + sleep — no countdown loop. Operators
+    # confirmed silent-run preference, but the pre-reboot warning is the
+    # operator-awareness step.
+    Write-Host ''
+    Write-Host '====================================================' -ForegroundColor Yellow
+    Write-Host '  UCPD configured. Computer will reboot in 30 seconds.' -ForegroundColor Yellow
+    Write-Host '  DO NOT INTERRUPT. OOBE will resume on next boot.' -ForegroundColor Yellow
+    Write-Host '====================================================' -ForegroundColor Yellow
+    Write-Host ''
+    Start-Sleep -Seconds 30
+    Restart-Computer -Force
+    # script execution ends here.
+}
+#EndRegion - PRP-70
+
 #Region - function to update windows
 Function UpdateWindows(){
     param(
@@ -2539,6 +2627,11 @@ Function Invoke-BiitPortalUpload() {
             Write-Host "`nUploaded." -ForegroundColor Green
             Write-Host "  Intake ID:  $($resp.intakeId)"
             Write-Host "  Portal:     https://portal.blackinkit.com/immy/autopilot/pending"
+
+            # PRP-70 — pre-configure UCPD before ImmyBot ever sees the
+            # device. Upload above is durable in DDB; reboot here is safe.
+            try { Invoke-BiitOobeUcpdConfigure -Enabled $false | Out-Null }
+            catch { Write-Host "UCPD pre-configure raised: $_" -ForegroundColor Yellow }
         } catch {
             Write-Host "Upload failed: $_" -ForegroundColor Red
         }
@@ -2569,6 +2662,11 @@ Function Invoke-BiitPortalUpload() {
             Write-Host "`nUploaded." -ForegroundColor Green
             Write-Host "  Intake ID: $($resp.intakeId)"
             Write-Host "  $($resp.message)"
+
+            # PRP-70 — pre-configure UCPD before ImmyBot ever sees the
+            # device. Upload above is durable in DDB; reboot here is safe.
+            try { Invoke-BiitOobeUcpdConfigure -Enabled $false | Out-Null }
+            catch { Write-Host "UCPD pre-configure raised: $_" -ForegroundColor Yellow }
         } catch {
             Write-Host "Upload failed: $_" -ForegroundColor Red
             Write-Host "(Codes are single-use and invalidate after 5 failed attempts.)" -ForegroundColor Yellow
