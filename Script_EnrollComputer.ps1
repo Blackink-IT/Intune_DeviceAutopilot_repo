@@ -2742,18 +2742,33 @@ Function Build-BiitOobeContextFile {
         Add-Line $regOut
     } catch { Add-Line "Provisioning diagnostics registry read failed: $_" }
 
-    $eventLogs = @(
-        'Microsoft-Windows-User Device Registration/Admin',
-        'Microsoft-Windows-AAD/Operational',
-        'Microsoft-Windows-ModernDeployment-Diagnostics-Provider/Autopilot',
-        'Microsoft-Windows-ModernDeployment-Diagnostics-Provider/ManagementService',
-        'Microsoft-Windows-Provisioning-Diagnostics-Provider/Admin',
-        'Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Admin'
+    # Per-channel MaxEvents — CSP/MDM channels get bigger windows because a
+    # 30-minute ESP hang produces hundreds of CSP processing events that we
+    # need to scan to find the specific provider that locked up. PaceAirFreight
+    # MZ038GGC 2026-05-20 investigation: 50 events was too few; the MDM-sync
+    # hang signal lived in events ~60-200 deep on the CSP channel.
+    $eventLogConfig = @(
+        @{Name='Microsoft-Windows-User Device Registration/Admin';                       Max=100},
+        @{Name='Microsoft-Windows-AAD/Operational';                                       Max=300},
+        @{Name='Microsoft-Windows-ModernDeployment-Diagnostics-Provider/Autopilot';       Max=300},
+        @{Name='Microsoft-Windows-ModernDeployment-Diagnostics-Provider/ManagementService';Max=200},
+        @{Name='Microsoft-Windows-Provisioning-Diagnostics-Provider/Admin';               Max=200},
+        @{Name='Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Admin';Max=500},
+        # New channels surfacing Sidecar / Cloud Auth Provider activity. These
+        # are silent during a healthy enrollment but light up when Sidecar
+        # (AAD Cloud AP plugin) install hangs — the exact failure mode where
+        # the prior 50-event window per channel was insufficient to find the
+        # specific stuck operation.
+        @{Name='Microsoft-Windows-CloudAP/Operational';                                   Max=200},
+        @{Name='Microsoft-Windows-AAD/Admin';                                             Max=200},
+        @{Name='Microsoft-Windows-CAPI2/Operational';                                     Max=100},
+        @{Name='Microsoft-Windows-Crypto-NCrypt/Operational';                             Max=100}
     )
-    foreach ($lg in $eventLogs) {
-        Add-Section "Event Log — $lg (most recent 50 events)"
+    foreach ($cfg in $eventLogConfig) {
+        $lg = $cfg.Name; $max = $cfg.Max
+        Add-Section "Event Log — $lg (most recent $max events)"
         try {
-            $events = Get-WinEvent -LogName $lg -MaxEvents 50 -ErrorAction Stop
+            $events = Get-WinEvent -LogName $lg -MaxEvents $max -ErrorAction Stop
             foreach ($ev in $events) {
                 $msg = if ($ev.Message) { $ev.Message -replace "`r`n", " | " -replace "`n", " | " } else { "<no message>" }
                 if ($msg.Length -gt 500) { $msg = $msg.Substring(0, 500) + "...[truncated]" }
@@ -2765,21 +2780,138 @@ Function Build-BiitOobeContextFile {
         }
     }
 
-    Add-Section "Network reachability (Autopilot / AAD / MDM endpoints, port 443)"
+    # TPM state — TpmOwned=True after a Reset is normal (Win10/11 doesn't
+    # clear TPM on reset), but leftover AAD-bound keys in the TPM can break
+    # subsequent Autopilot attempts (per Pace MZ038GGC 2026-05-20). Capture
+    # both Get-Tpm + Get-TpmEndorsementKeyInfo so we see EK presence.
+    Add-Section "TPM state (Get-Tpm + Get-TpmEndorsementKeyInfo)"
+    try {
+        $tpm = Get-Tpm -ErrorAction Stop
+        Add-Line ($tpm | Format-List | Out-String)
+        $ek = Get-TpmEndorsementKeyInfo -ErrorAction SilentlyContinue
+        if ($ek) { Add-Line ($ek | Format-List | Out-String) }
+    } catch { Add-Line "Get-Tpm failed: $_" }
+
+    # BitLocker — Sidecar provisioning can race against BitLocker auto-encrypt
+    # if the device meets hardware requirements. Capture volume + protector
+    # state. If BitLocker engaged during a prior failed ESP and TPM was then
+    # cleared, the volume key can be unrecoverable.
+    Add-Section "BitLocker volumes (Get-BitLockerVolume)"
+    try {
+        $blv = Get-BitLockerVolume -ErrorAction SilentlyContinue
+        if ($blv) {
+            Add-Line ($blv | Format-Table MountPoint,VolumeStatus,ProtectionStatus,EncryptionPercentage,VolumeType -AutoSize | Out-String)
+            foreach ($v in $blv) {
+                Add-Line "Protectors on $($v.MountPoint):"
+                Add-Line (($v.KeyProtector | Format-List | Out-String))
+            }
+        } else { Add-Line "No BitLocker volumes reported." }
+    } catch { Add-Line "Get-BitLockerVolume failed: $_" }
+
+    # MS-Organization-Access certificates — the AAD device cert lives here.
+    # Multiple certs of this issuer = leftover joins from prior attempts =
+    # likely cause of the 'AutoPilot device claimed' 0x801c03f2 directory_error.
+    Add-Section "MS-Organization certificates (Cert:\LocalMachine\My + Root)"
+    try {
+        $certs = Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Subject -like '*MS-Organization-Access*' -or $_.Issuer -like '*MS-Organization*' }
+        if ($certs) {
+            foreach ($c in $certs) {
+                Add-Line "Subject: $($c.Subject)"
+                Add-Line "  Issuer: $($c.Issuer)"
+                Add-Line "  NotBefore: $($c.NotBefore)  NotAfter: $($c.NotAfter)"
+                Add-Line "  Thumbprint: $($c.Thumbprint)"
+                Add-Line ""
+            }
+        } else { Add-Line "No MS-Organization-Access certs found." }
+    } catch { Add-Line "Cert store read failed: $_" }
+
+    # OMA-DM session state — when an MDM sync session hangs (the Pace
+    # 2026-05-20 root cause), the session id is recorded here. Compare
+    # session GUIDs against the ManagementService event log to find which
+    # CSP locked up.
+    Add-Section "OMA-DM sessions (HKLM:\SOFTWARE\Microsoft\Provisioning\OMADM\Sessions)"
+    try {
+        $omadmOut = & reg.exe query 'HKLM\SOFTWARE\Microsoft\Provisioning\OMADM' /s 2>&1 | Out-String
+        Add-Line $omadmOut
+    } catch { Add-Line "OMA-DM registry read failed: $_" }
+
+    # Key services that Sidecar / AAD Cloud AP / MDM depend on. A stopped
+    # service here can cause silent ESP timeout with no other smoking gun.
+    Add-Section "Key Microsoft services (Get-Service)"
+    $serviceNames = @('dmwappushservice','wuauserv','w32time','MpsSvc','IKEEXT',
+                      'CryptSvc','BFE','EventLog','TrustedInstaller','DcomLaunch',
+                      'lfsvc','TokenBroker','wlpasvc','UserManager','WlanSvc',
+                      'wcncsvc','WebClient','wppushservice')
+    foreach ($svc in $serviceNames) {
+        try {
+            $s = Get-Service -Name $svc -ErrorAction Stop
+            Add-Line ("  {0,-25} Status={1,-10}  StartType={2}" -f $svc, $s.Status, $s.StartType)
+        } catch { Add-Line "  $svc not found" }
+    }
+
+    # MDM-relevant processes — if one of these is missing or hung, ESP
+    # blocks. Capture process state + start time so we can see if anything
+    # crashed/restarted during the ESP window.
+    Add-Section "MDM / AAD processes (Get-Process)"
+    $procNames = @('dasHost','MdmDiagnosticsTool','OOBE_FirstLogon','OneSettingsClient',
+                   'CloudExperienceHost','OOBE_LogonNoUI','svchost')
+    try {
+        $procs = Get-Process -ErrorAction SilentlyContinue | Where-Object { $procNames -contains $_.ProcessName }
+        if ($procs) {
+            $procs | Sort-Object ProcessName | Format-Table Id,ProcessName,StartTime,@{n='WS_MB';e={[int]($_.WorkingSet64/1MB)}} -AutoSize | Out-String | ForEach-Object { Add-Line $_ }
+        }
+    } catch { Add-Line "Get-Process failed: $_" }
+
+    Add-Section "Network reachability + DNS + TLS handshake (Autopilot / AAD / MDM endpoints)"
     $endpoints = @(
         'enterpriseregistration.windows.net',
         'device.login.microsoftonline.com',
         'login.microsoftonline.com',
         'enrollment.manage.microsoft.com',
         'manage.microsoft.com',
-        'graph.microsoft.com'
+        'graph.microsoft.com',
+        # Sidecar / Cloud Auth Provider specific endpoints. Microsoft routes
+        # AAD Cloud AP plugin auth through these — a Test-NetConnection on
+        # port 443 isn't enough; we want to see the DNS + TLS handshake
+        # actually complete because Sidecar's auth retries don't always
+        # surface specific endpoint failures in the event log.
+        'aadcdn.msauth.net',
+        'login.live.com',
+        'autologon.microsoftazuread-sso.com'
     )
     foreach ($ep in $endpoints) {
+        # DNS resolution — captures whether the hostname even resolves
         try {
-            $r = Test-NetConnection -ComputerName $ep -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction Stop
-            Add-Line ("  {0}:443 = {1}" -f $ep, $r)
+            $dns = Resolve-DnsName -Name $ep -Type A -ErrorAction Stop -DnsOnly | Select-Object -First 5
+            $ips = ($dns | ForEach-Object { $_.IPAddress }) -join ','
+            Add-Line ("  DNS  {0,-45} = {1}" -f $ep, $ips)
         } catch {
-            Add-Line ("  {0}:443 = error: {1}" -f $ep, $_.Exception.Message)
+            Add-Line ("  DNS  {0,-45} = FAILED: {1}" -f $ep, $_.Exception.Message)
+            continue
+        }
+        # TCP 443 reachability
+        try {
+            $tnc = Test-NetConnection -ComputerName $ep -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction Stop
+            Add-Line ("  TCP  {0,-45} = {1}" -f $ep, $tnc)
+        } catch {
+            Add-Line ("  TCP  {0,-45} = error: {1}" -f $ep, $_.Exception.Message)
+        }
+        # TLS handshake — confirms cert chain validates against trusted
+        # roots, which catches the rare case where DNS+TCP work but TLS
+        # fails (proxy MitM, missing root, time skew, etc.)
+        try {
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            $tcp.ReceiveTimeout = 5000
+            $tcp.SendTimeout = 5000
+            $tcp.Connect($ep, 443)
+            $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(), $false, {param($s,$c,$h,$e) $true})
+            $ssl.AuthenticateAsClient($ep)
+            $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($ssl.RemoteCertificate)
+            Add-Line ("  TLS  {0,-45} = OK  CN={1}  NotAfter={2}" -f $ep, $cert.Subject, $cert.NotAfter.ToString('yyyy-MM-dd'))
+            $ssl.Close(); $tcp.Close()
+        } catch {
+            Add-Line ("  TLS  {0,-45} = FAILED: {1}" -f $ep, $_.Exception.Message)
         }
     }
 
@@ -2977,8 +3109,12 @@ Function Invoke-BiitDiagnosticsCapture {
          EnrollmentScript-*.log" approach being too narrow — the 5-file
          backend cap is preserved by collapsing all script logs into one
          archive slot.
-      5. Spare slot — currently unused, reserved for future per-failure
-         additions (e.g. an Autopilot-specific Event Log dump).
+      5. MDMDiagReport.xml — uncompressed CSP processing trace from
+         MdmDiagnosticsTool -out. Sidesteps the LZX compression in the CAB
+         so the BIIT backend / Linux-side tooling can parse the XML directly
+         to find which specific CSP hung during ESP DeviceSetup. The same
+         data is also inside the CAB but extracting from LZX cabs without
+         a Windows machine is painful.
 
     Each file is capped at $MaxBytes (default 10 MB) before encoding;
     files larger than the cap are tail-truncated to the last $MaxBytes
@@ -2999,10 +3135,13 @@ Function Invoke-BiitDiagnosticsCapture {
     # 1) MdmDiagnosticsTool — produces the CAB. Always attempt; the tool
     # writes a non-zero exit code if the device has never started enrollment,
     # but the CAB usually still contains useful registry exports.
+    # Expanded -area list (2026-05-20 Pace investigation): added DeviceEnrollment
+    # and TPM so the CAB carries the full MDM enrollment session state +
+    # TPM context. Output stays under 5 MB even with the broader scope.
     try {
         if (Test-Path $cabPath) { Remove-Item $cabPath -Force -ErrorAction SilentlyContinue }
         $proc = Start-Process -FilePath "$env:windir\System32\MdmDiagnosticsTool.exe" `
-            -ArgumentList @('-area','Autopilot;DeviceProvisioning','-cab',$cabPath) `
+            -ArgumentList @('-area','Autopilot;DeviceProvisioning;DeviceEnrollment;TPM','-cab',$cabPath) `
             -NoNewWindow -PassThru -Wait -ErrorAction Stop
         if ($proc.ExitCode -ne 0) {
             Write-Host "  MdmDiagnosticsTool exit code $($proc.ExitCode) — continuing with whatever it produced." -ForegroundColor Yellow
@@ -3010,6 +3149,32 @@ Function Invoke-BiitDiagnosticsCapture {
     } catch {
         Write-Host "  MdmDiagnosticsTool failed: $_" -ForegroundColor Yellow
         # Continue — we still have IME + script logs + the script-built context.
+    }
+
+    # 1b) MdmDiagnosticsTool -out: also produce UNCOMPRESSED output in a
+    # temp directory so we can extract MDMDiagReport.xml separately. The
+    # -cab path uses LZX compression which most non-Windows extractors can't
+    # decode (caught analysing the Pace MZ038GGC 2026-05-20 diag — `cabextract`
+    # and Python `cabarchive` both choked on LZX). MDMDiagReport.xml has the
+    # CSP processing trace + per-policy result + session GUIDs that the cab
+    # XML extraction would expose.
+    $mdmOutDir = "C:\Windows\Temp\biit-mdm-out-$serial"
+    $mdmDiagReportPath = $null
+    try {
+        if (Test-Path $mdmOutDir) { Remove-Item $mdmOutDir -Recurse -Force -ErrorAction SilentlyContinue }
+        New-Item -ItemType Directory -Path $mdmOutDir -Force -ErrorAction Stop | Out-Null
+        $proc2 = Start-Process -FilePath "$env:windir\System32\MdmDiagnosticsTool.exe" `
+            -ArgumentList @('-area','Autopilot;DeviceProvisioning;DeviceEnrollment','-out',$mdmOutDir) `
+            -NoNewWindow -PassThru -Wait -ErrorAction Stop
+        $xml = Get-ChildItem -Path $mdmOutDir -Filter 'MDMDiagReport.xml' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($xml) {
+            # Copy to a well-known name alongside the CAB so the upload
+            # selector can find it deterministically.
+            $mdmDiagReportPath = "C:\Windows\Temp\mdm-diag-report-$serial.xml"
+            Copy-Item -Path $xml.FullName -Destination $mdmDiagReportPath -Force -ErrorAction Stop
+        }
+    } catch {
+        Write-Host "  MdmDiagnosticsTool -out (uncompressed XML) failed: $_" -ForegroundColor Yellow
     }
 
     $candidates = @()
@@ -3039,6 +3204,14 @@ Function Invoke-BiitDiagnosticsCapture {
     $tempLogsZipPath = Build-BiitTempLogsZip -Serial $serial
     if ($tempLogsZipPath -and (Test-Path $tempLogsZipPath)) {
         $candidates += (Get-Item $tempLogsZipPath)
+    }
+
+    # 5) MDMDiagReport.xml — uncompressed CSP processing trace. Produced
+    # alongside the CAB above so backend can parse on Linux without needing
+    # an LZX cab extractor.
+    if ($mdmDiagReportPath -and (Test-Path $mdmDiagReportPath)) {
+        Write-Host "  Including uncompressed MDMDiagReport.xml…" -ForegroundColor Gray
+        $candidates += (Get-Item $mdmDiagReportPath)
     }
 
     if (-not $candidates -or $candidates.Count -eq 0) {
