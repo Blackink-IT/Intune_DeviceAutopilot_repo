@@ -2866,8 +2866,50 @@ Function Build-BiitOobeContextFile {
         }
     } catch { Add-Line "Get-Process failed: $_" }
 
-    Add-Section "Network reachability + DNS + TLS handshake (Autopilot / AAD / MDM endpoints)"
+    # DNS resolver state — which server(s) is the device asking?
+    # If Pace's network injects a filtering DNS (e.g. Cisco Umbrella, an
+    # internal DNS that drops *.azureedge.net, a captive-portal helper),
+    # this is where we'd see it. PaceAirFreight MZ038GGC 2026-05-20: the
+    # AAD/MDM endpoints all resolved fine via 8.8.8.8-style upstreams,
+    # but if Sidecar's IME content downloads go through a different
+    # resolver path (some apps query directly via the configured DNS
+    # rather than via the system stub), that resolver might filter
+    # *.azureedge.net while leaving manage.microsoft.com alone.
+    Add-Section "DNS resolver configuration (Get-DnsClientServerAddress)"
+    try {
+        $dnsClients = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction Stop |
+                      Where-Object { $_.ServerAddresses -and $_.ServerAddresses.Count -gt 0 }
+        foreach ($d in $dnsClients) {
+            Add-Line ("  {0,-30} (idx {1})  servers = {2}" -f $d.InterfaceAlias, $d.InterfaceIndex, ($d.ServerAddresses -join ','))
+        }
+    } catch { Add-Line "Get-DnsClientServerAddress failed: $_" }
+
+    Add-Section "Network reachability + DNS + TLS handshake (Autopilot / AAD / MDM / IME endpoints)"
+    # Endpoint categories (expanded 2026-05-20 after PaceAirFreight MZ038GGC
+    # Sidecar timeout investigation):
+    #   AAD/MDM core   — already needed for enrollment to begin (the original
+    #                    set)
+    #   Intune routing — manage.microsoft.com siblings that the MDM client uses
+    #                    for content + policy refresh (referenced in OMA-DM
+    #                    session URLs e.g. r.manage.microsoft.com/devicegateway...)
+    #   IME content    — naprod*.azureedge.net + swda01-mscdn.azureedge.net
+    #                    CDNs where the Intune Management Extension MSI and the
+    #                    Win32 app payloads it manages are actually downloaded.
+    #                    PaceAirFreight MZ038GGC 2026-05-20: "Policy provider
+    #                    'Sidecar' installation timed out after 30 minutes" with
+    #                    zero IME artifacts on disk strongly suggests Sidecar
+    #                    can't reach these specific CDNs. They were NOT in the
+    #                    earlier endpoint list — the AAD/MDM core all resolved
+    #                    fine but Sidecar still failed.
+    #   WNS push       — Sidecar uses WNS to receive policy-pushed notifications
+    #                    during ESP. If WNS is blocked, IME install is silently
+    #                    pending.
+    #   Delivery Opt   — `*.delivery.mp.microsoft.com` is used by Microsoft's
+    #                    content delivery network on Win32 app payloads.
+    #   Time           — Sidecar token validation breaks on >5 min clock skew;
+    #                    the device must reach a time source.
     $endpoints = @(
+        # === AAD / MDM core ===
         'enterpriseregistration.windows.net',
         'device.login.microsoftonline.com',
         'login.microsoftonline.com',
@@ -2881,7 +2923,29 @@ Function Build-BiitOobeContextFile {
         # surface specific endpoint failures in the event log.
         'aadcdn.msauth.net',
         'login.live.com',
-        'autologon.microsoftazuread-sso.com'
+        'autologon.microsoftazuread-sso.com',
+        # === Intune service routing ===
+        # r.manage.microsoft.com appears in the device's OMA-DM session URL
+        # (https://r.manage.microsoft.com/devicegatewayproxy/cimhandler.ashx).
+        # If reachable from the AAD/MDM enrollment endpoints but blocked here,
+        # the device enrolls but can't sync.
+        'r.manage.microsoft.com',
+        'i.manage.microsoft.com',
+        'fef.manage.microsoft.com',
+        # === IME content delivery CDNs (load-bearing for Sidecar/IME install) ===
+        # These are the actual download URLs the Intune Management Extension
+        # uses for its own MSI + for the Win32 app content it manages.
+        # naprod = North America Production, ime = Intune Management Extension.
+        'naprodimedatapri.azureedge.net',
+        'naprodimedatasec.azureedge.net',
+        'naprodimedatahotfix.azureedge.net',
+        'swda01-mscdn.azureedge.net',
+        # === WNS push (policy notifications during ESP) ===
+        'client.wns.windows.com',
+        # === Delivery Optimization (Win32 app content) ===
+        'dl.delivery.mp.microsoft.com',
+        # === Time sync ===
+        'time.windows.com'
     )
     foreach ($ep in $endpoints) {
         # DNS resolution — captures whether the hostname even resolves
@@ -2917,6 +2981,110 @@ Function Build-BiitOobeContextFile {
             Add-Line ("  TLS  {0,-45} = FAILED: {1}" -f $ep, $_.Exception.Message)
         }
     }
+
+    # HTTP-level probe to a known IME CDN URL — confirms not just TLS but
+    # that an actual HTTP request makes it through any in-path proxy. Naprod
+    # IME CDN endpoints serve content over HTTPS; a HEAD against the index
+    # path returns 200/403 (Azure CDN's "no specific object requested" reply)
+    # if the path is reachable. A 502/503/504 or connection drop indicates
+    # an in-path appliance is interfering. Anonymous request OK — these
+    # endpoints don't require auth at the connection level, only at the
+    # signed-URL level for actual content downloads.
+    Add-Section "HTTP-level probe (anonymous HEAD against IME CDNs)"
+    $httpProbes = @(
+        'https://naprodimedatapri.azureedge.net/',
+        'https://naprodimedatasec.azureedge.net/',
+        'https://naprodimedatahotfix.azureedge.net/',
+        'https://swda01-mscdn.azureedge.net/',
+        'https://r.manage.microsoft.com/StatelessRedirector/clientstatus',
+        # The Intune Management Extension's MSI is served from here.
+        # We can't predict the full signed URL, but a HEAD on the root
+        # confirms reachability.
+        'https://i.manage.microsoft.com/'
+    )
+    foreach ($url in $httpProbes) {
+        try {
+            $req = [System.Net.HttpWebRequest]::Create($url)
+            $req.Method = 'HEAD'
+            $req.Timeout = 10000
+            $req.AllowAutoRedirect = $false
+            $req.UserAgent = 'BIIT-OOBE-DiagnosticProbe/1.0'
+            $resp = $null
+            try { $resp = $req.GetResponse() } catch [System.Net.WebException] {
+                # 4xx/5xx still gives us a response with headers — that's
+                # what we want. Only a raw socket failure indicates the
+                # endpoint is blocked.
+                $resp = $_.Exception.Response
+                if (-not $resp) { throw }
+            }
+            $status = [int]$resp.StatusCode
+            $hdrs = @()
+            foreach ($h in @('Server','x-azure-ref','x-cache','Date','Content-Type')) {
+                $v = $resp.Headers[$h]
+                if ($v) { $hdrs += ("{0}={1}" -f $h, $v.Substring(0, [Math]::Min($v.Length, 50))) }
+            }
+            Add-Line ("  HTTP {0,-55} = {1}  {2}" -f $url, $status, ($hdrs -join '; '))
+            $resp.Close()
+        } catch {
+            Add-Line ("  HTTP {0,-55} = FAILED: {1}" -f $url, $_.Exception.Message)
+        }
+    }
+
+    # Path-MTU probe — large payloads (the IME MSI is ~9 MB, Win32 content
+    # is often 50-500 MB) get fragmented; if the network path has a MTU
+    # smaller than the device thinks, and the path drops DF=1 packets
+    # silently (PMTU black-holes), large downloads stall while small
+    # probes succeed. `ping -f -l <size>` sends a packet of <size> with
+    # the Don't Fragment bit set; if it succeeds, the path supports at
+    # least that MTU. We probe at standard 1500-byte (1472 payload) and
+    # at a more conservative 1400 (Microsoft's recommended floor for
+    # Intune content downloads). A failure at 1472 but success at 1400
+    # is a strong "MTU black-hole" signal worth flagging.
+    Add-Section "Path-MTU probe (ping -f -l N) to Microsoft endpoints"
+    $mtuTargets = @(
+        @{Host='manage.microsoft.com'; Label='Intune service'},
+        @{Host='naprodimedatapri.azureedge.net'; Label='IME content CDN'}
+    )
+    $mtuSizes = @(1472, 1400, 1300)
+    foreach ($t in $mtuTargets) {
+        foreach ($size in $mtuSizes) {
+            try {
+                $out = & ping.exe -n 1 -f -l $size -w 3000 $t.Host 2>&1 | Out-String
+                $ok = $out -match 'Received = 1'
+                $fragNeeded = $out -match 'Packet needs to be fragmented'
+                $unreach = $out -match 'unreachable'
+                $marker = if ($ok) { 'OK    ' } elseif ($fragNeeded) { 'FRAGMENT' } elseif ($unreach) { 'UNREACH' } else { 'FAIL  ' }
+                Add-Line ("  MTU  {0,-45} payload={1,5}  result={2}" -f ($t.Label + ' (' + $t.Host + ')'), $size, $marker)
+            } catch {
+                Add-Line ("  MTU  {0,-45} payload={1,5}  result=ERROR: {2}" -f $t.Label, $size, $_.Exception.Message)
+            }
+        }
+    }
+
+    # HTTP proxy detection — if a WPAD or PAC-injected proxy is being
+    # consulted between our test code and an actual HTTP request, the
+    # WinHttp default proxy section above (DIRECT) doesn't catch that.
+    # Reading the system's effective .NET WebProxy reveals what the
+    # CLR (and therefore IME, which is .NET-based) actually uses.
+    Add-Section "Effective .NET WebProxy + WinINet proxy (per-user IE/WinINet view)"
+    try {
+        $defProxy = [System.Net.WebRequest]::DefaultWebProxy
+        $probeUrl = 'https://manage.microsoft.com/'
+        $effectiveUri = $defProxy.GetProxy([Uri]$probeUrl)
+        if ($effectiveUri.AbsoluteUri -ne $probeUrl) {
+            Add-Line "  .NET WebProxy for $probeUrl = $($effectiveUri.AbsoluteUri)"
+        } else {
+            Add-Line "  .NET WebProxy: DIRECT (no proxy for $probeUrl)"
+        }
+    } catch { Add-Line ".NET WebProxy probe failed: $_" }
+    # WinINet (IE/Edge legacy) — different surface from WinHttp; some
+    # apps use WinINet specifically.
+    try {
+        $wininet = & reg.exe query 'HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings' /v ProxyServer 2>&1 | Out-String
+        Add-Line "  WinINet ProxyServer (HKCU): $wininet"
+        $wininetEnable = & reg.exe query 'HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings' /v ProxyEnable 2>&1 | Out-String
+        Add-Line "  WinINet ProxyEnable (HKCU): $wininetEnable"
+    } catch { Add-Line "WinINet registry probe failed: $_" }
 
     Add-Section "Time sync (w32tm /query /status)"
     try {
