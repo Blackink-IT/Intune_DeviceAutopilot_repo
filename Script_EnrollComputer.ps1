@@ -2998,7 +2998,9 @@ Function Build-BiitTempLogsZip {
     $exclude = @(
         "autopilot-diag-$Serial.cab",
         "oobe-context-$Serial.txt",
-        "oobe-temp-logs-$Serial.zip"
+        "oobe-temp-logs-$Serial.zip",
+        "ime-and-debug-$Serial.zip",
+        "mdm-diag-out-$Serial.zip"
     )
 
     $files = @()
@@ -3088,6 +3090,287 @@ Function Build-BiitTempLogsZip {
     return $zipPath
 }
 
+Function Build-BiitImeAndDebugZip {
+    <#
+    Bundles all IntuneManagementExtension logs + per-app install state
+    registry dumps + the AAD-CloudAP/Operational + AppXDeployment-Server
+    /Operational EVTX exports (if those channels exist on this build)
+    into a single ZIP at C:\Windows\Temp\ime-and-debug-{serial}.zip.
+
+    Why: option [6]'s prior shape only captured the NEWEST 1 IME log
+    (slot 3 of the 5-file cap). On 2026-05-20 the PaceAirFreight MZ038GGC
+    investigation showed that the Sidecar timeout's root cause —
+    "Timed out waiting for all policy providers to provide a list of
+    policies" — needed the FULL set of IME logs (Win32 app install
+    state, Sidecar handoff timing) AND the registry hive that names
+    which specific Win32 app the Intune Management Extension was
+    waiting on. A single newest-log was not enough.
+
+    Contents:
+      - C:\ProgramData\Microsoft\IntuneManagementExtension\Logs\*.log
+        (all logs; per-file tail-trim at 5 MB so a bloated IME log
+        doesn't dominate)
+      - ime-app-state.reg     — HKLM:\SOFTWARE\Microsoft\IntuneManagementExtension\*
+        per-Win32-app install attempt + content download state
+      - enrollment-state.reg  — HKLM:\SOFTWARE\Microsoft\Enrollments\*
+        per-category ESP state (DevicePreparation, DeviceSetup,
+        AccountSetup) + FirstSync per-CSP status
+      - aad-cloudap.evtx      — Microsoft-Windows-AAD-CloudAP/Operational
+        if the channel exists on this Windows build (Sidecar / Cloud
+        AP plugin activity)
+      - appx-deployment.evtx  — Microsoft-Windows-AppXDeploymentServer
+        /Operational if the channel exists (UWP / Sidecar app install)
+      - summary.txt           — Get-AppxPackage state for the Sidecar-
+        adjacent UWP packages (CloudExperienceHost, OOBE, AAD Broker
+        Plugin) + a manifest of what got bundled
+
+    Per-file FileShare.ReadWrite reads (the IME log writer is held open
+    by the IntuneManagementExtension service while the agent is alive).
+    Returns the ZIP file path on success, $null if nothing was found
+    to bundle. Skip-if-missing semantics for every input — the script
+    must keep running even if the IME directory doesn't exist yet
+    (Pace's PAF-WKS038 case where IME never made it past the policy-
+    provider wait).
+    #>
+    param(
+        [string]$Serial,
+        [int]$PerFileMaxBytes = 5242880   # 5 MB per file inside the ZIP
+    )
+
+    $tempDir = 'C:\Windows\Temp'
+    if (-not (Test-Path $tempDir)) { return $null }
+
+    $zipPath = Join-Path $tempDir "ime-and-debug-$Serial.zip"
+    if (Test-Path $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
+
+    # Working staging dir for non-IME inputs (reg exports, evtx exports,
+    # summary). Cleared/recreated each run.
+    $stageDir = Join-Path $tempDir "ime-and-debug-stage-$Serial"
+    if (Test-Path $stageDir) { Remove-Item $stageDir -Recurse -Force -ErrorAction SilentlyContinue }
+    try { New-Item -ItemType Directory -Path $stageDir -Force -ErrorAction Stop | Out-Null }
+    catch {
+        Write-Host "  ime-and-debug: could not create stage dir: $_" -ForegroundColor Yellow
+        return $null
+    }
+
+    # --- 1. Collect IME logs --------------------------------------------------
+    $imeDir = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs"
+    $imeLogs = @()
+    if (Test-Path $imeDir) {
+        $imeLogs = Get-ChildItem -Path $imeDir -Filter '*.log' -ErrorAction SilentlyContinue |
+                   Sort-Object LastWriteTime -Descending
+    } else {
+        Write-Host "  ime-and-debug: IME log dir not present ($imeDir) -- IME may not have started yet." -ForegroundColor Yellow
+    }
+
+    # --- 2. Registry dumps ---------------------------------------------------
+    # `reg.exe export` writes a portable .reg text file; we add a .reg
+    # extension explicitly so the entry inside the ZIP has the right name.
+    $imeRegPath = Join-Path $stageDir "ime-app-state.reg"
+    try {
+        & reg.exe export 'HKLM\SOFTWARE\Microsoft\IntuneManagementExtension' $imeRegPath /y 2>&1 | Out-Null
+        if (-not (Test-Path $imeRegPath)) {
+            # IntuneManagementExtension key absent -- record that explicitly
+            "Key HKLM\SOFTWARE\Microsoft\IntuneManagementExtension not present at $(Get-Date -Format o)" |
+                Set-Content -Path $imeRegPath -Encoding UTF8
+        }
+    } catch {
+        "reg export failed: $_" | Set-Content -Path $imeRegPath -Encoding UTF8
+    }
+
+    $enrollRegPath = Join-Path $stageDir "enrollment-state.reg"
+    try {
+        & reg.exe export 'HKLM\SOFTWARE\Microsoft\Enrollments' $enrollRegPath /y 2>&1 | Out-Null
+        if (-not (Test-Path $enrollRegPath)) {
+            "Key HKLM\SOFTWARE\Microsoft\Enrollments not present at $(Get-Date -Format o)" |
+                Set-Content -Path $enrollRegPath -Encoding UTF8
+        }
+    } catch {
+        "reg export failed: $_" | Set-Content -Path $enrollRegPath -Encoding UTF8
+    }
+
+    # --- 3. EVTX channel exports (try-soft) ----------------------------------
+    # `wevtutil epl` exports the full binary EVTX file (much richer than
+    # `Get-WinEvent | Export-Clixml`). Channels that don't exist on this
+    # Windows build return non-zero exit; skip silently.
+    $evtxTargets = @(
+        @{ Channel='Microsoft-Windows-AAD-CloudAP/Operational';        File='aad-cloudap.evtx' },
+        @{ Channel='Microsoft-Windows-AppXDeploymentServer/Operational'; File='appx-deployment.evtx' },
+        @{ Channel='Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Debug'; File='dm-debug.evtx' }
+    )
+    foreach ($t in $evtxTargets) {
+        $outPath = Join-Path $stageDir $t.File
+        try {
+            $proc = Start-Process -FilePath "$env:windir\System32\wevtutil.exe" `
+                -ArgumentList @('epl', $t.Channel, $outPath, '/ow:true') `
+                -NoNewWindow -PassThru -Wait -ErrorAction Stop
+            if ($proc.ExitCode -ne 0 -or -not (Test-Path $outPath)) {
+                Write-Host "  ime-and-debug: channel $($t.Channel) not exported (exit $($proc.ExitCode))." -ForegroundColor Gray
+                if (Test-Path $outPath) { Remove-Item $outPath -Force -ErrorAction SilentlyContinue }
+            }
+        } catch {
+            Write-Host "  ime-and-debug: wevtutil epl failed for $($t.Channel): $_" -ForegroundColor Gray
+        }
+    }
+
+    # --- 4. Summary.txt -------------------------------------------------------
+    $summaryPath = Join-Path $stageDir "summary.txt"
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine("ime-and-debug bundle for $Serial")
+    [void]$sb.AppendLine("Generated: $((Get-Date).ToUniversalTime().ToString('o'))")
+    [void]$sb.AppendLine("")
+    [void]$sb.AppendLine("=== IME logs found ===")
+    if ($imeLogs) {
+        foreach ($l in $imeLogs) {
+            $size = [Math]::Round($l.Length / 1KB, 1)
+            [void]$sb.AppendLine(("  {0,-50} {1,8} KB  {2}" -f $l.Name, $size, $l.LastWriteTime.ToString('s')))
+        }
+    } else {
+        [void]$sb.AppendLine("  (none)")
+    }
+    [void]$sb.AppendLine("")
+    [void]$sb.AppendLine("=== Get-AppxPackage (Sidecar / OOBE / CloudExperience adjacent) ===")
+    $pkgPatterns = @(
+        'Microsoft.AAD.BrokerPlugin',
+        '*CloudExperience*',
+        'Microsoft.Windows.CloudExperienceHost',
+        'Microsoft.AccountsControl',
+        '*OOBE*',
+        '*Sidecar*'
+    )
+    foreach ($pat in $pkgPatterns) {
+        try {
+            $pkgs = Get-AppxPackage -Name $pat -AllUsers -ErrorAction SilentlyContinue
+            if ($pkgs) {
+                foreach ($p in $pkgs) {
+                    [void]$sb.AppendLine(("  {0,-50} v={1,-15} Inst={2}" -f $p.Name, $p.Version, $p.InstallLocation))
+                }
+            }
+        } catch { }
+    }
+    [void]$sb.AppendLine("")
+    [void]$sb.AppendLine("=== IntuneManagementExtension service state ===")
+    try {
+        $imeSvc = Get-Service -Name 'IntuneManagementExtension' -ErrorAction SilentlyContinue
+        if ($imeSvc) {
+            [void]$sb.AppendLine("  IntuneManagementExtension Status=$($imeSvc.Status) StartType=$($imeSvc.StartType)")
+        } else {
+            [void]$sb.AppendLine("  Service IntuneManagementExtension not present yet.")
+        }
+    } catch {
+        [void]$sb.AppendLine("  Get-Service failed: $_")
+    }
+    [void]$sb.AppendLine("")
+    [void]$sb.AppendLine("=== IME process state ===")
+    try {
+        $imeProcs = Get-Process -ErrorAction SilentlyContinue |
+                    Where-Object { $_.ProcessName -in @('IntuneManagementExtension','AgentExecutor','ClientHealthEval','Microsoft.Management.Services.IntuneWindowsAgent') }
+        if ($imeProcs) {
+            foreach ($p in $imeProcs) {
+                [void]$sb.AppendLine(("  PID={0} {1,-45} Start={2} WS={3} MB" -f $p.Id, $p.ProcessName, $p.StartTime, [int]($p.WorkingSet64/1MB)))
+            }
+        } else {
+            [void]$sb.AppendLine("  No IME-related processes running.")
+        }
+    } catch {
+        [void]$sb.AppendLine("  Get-Process failed: $_")
+    }
+    try {
+        [System.IO.File]::WriteAllText($summaryPath, $sb.ToString())
+    } catch {
+        Write-Host "  ime-and-debug: failed to write summary.txt: $_" -ForegroundColor Yellow
+    }
+
+    # --- 5. Assemble the ZIP --------------------------------------------------
+    # Use System.IO.Compression directly so we can feed FileShare.ReadWrite
+    # reads (mirrors Build-BiitTempLogsZip — the IME log writer is held
+    # open by the IntuneManagementExtension service).
+    try {
+        Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    } catch { }
+
+    $fs = $null
+    $archive = $null
+    $bundled = 0
+    try {
+        $fs = [System.IO.File]::Open($zipPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $archive = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Create)
+
+        function _AddBytes {
+            param([string]$EntryName, [byte[]]$Bytes)
+            $entry = $archive.CreateEntry($EntryName, [System.IO.Compression.CompressionLevel]::Optimal)
+            $es = $entry.Open()
+            try { $es.Write($Bytes, 0, $Bytes.Length) } finally { $es.Close() }
+        }
+
+        # 5a. IME logs (FileShare.ReadWrite read + tail-trim)
+        foreach ($f in $imeLogs) {
+            try {
+                $rs = [System.IO.File]::Open(
+                    $f.FullName,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read,
+                    [System.IO.FileShare]::ReadWrite
+                )
+                try {
+                    $len = $rs.Length
+                    $buf = New-Object byte[] $len
+                    $offset = 0
+                    while ($offset -lt $len) {
+                        $read = $rs.Read($buf, $offset, $len - $offset)
+                        if ($read -le 0) { break }
+                        $offset += $read
+                    }
+                } finally { $rs.Dispose() }
+
+                if ($buf.Length -gt $PerFileMaxBytes) {
+                    $tail = New-Object byte[] $PerFileMaxBytes
+                    [System.Array]::Copy($buf, $buf.Length - $PerFileMaxBytes, $tail, 0, $PerFileMaxBytes)
+                    $buf = $tail
+                }
+                _AddBytes -EntryName ("ime-logs/" + $f.Name) -Bytes $buf
+                $bundled++
+            } catch {
+                Write-Host "  ime-and-debug: skipped '$($f.Name)' — $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+
+        # 5b. Staged files (reg exports + evtx + summary)
+        $staged = Get-ChildItem -Path $stageDir -File -ErrorAction SilentlyContinue
+        foreach ($s in $staged) {
+            try {
+                $b = [System.IO.File]::ReadAllBytes($s.FullName)
+                if ($b.Length -gt $PerFileMaxBytes) {
+                    $tail = New-Object byte[] $PerFileMaxBytes
+                    [System.Array]::Copy($b, $b.Length - $PerFileMaxBytes, $tail, 0, $PerFileMaxBytes)
+                    $b = $tail
+                }
+                _AddBytes -EntryName $s.Name -Bytes $b
+                $bundled++
+            } catch {
+                Write-Host "  ime-and-debug: skipped stage file '$($s.Name)' — $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+    } catch {
+        Write-Host "  ime-and-debug: ZIP creation hard-failed: $_" -ForegroundColor Yellow
+        return $null
+    } finally {
+        if ($archive) { $archive.Dispose() }
+        if ($fs)      { $fs.Dispose() }
+        # Clean up staging dir but leave the ZIP
+        if (Test-Path $stageDir) { Remove-Item $stageDir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    if ($bundled -eq 0) {
+        if (Test-Path $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
+        Write-Host "  ime-and-debug: no inputs available -- not producing a ZIP." -ForegroundColor Gray
+        return $null
+    }
+    Write-Host "  ime-and-debug: bundled $bundled file(s) -> $zipPath" -ForegroundColor Gray
+    return $zipPath
+}
+
 Function Invoke-BiitDiagnosticsCapture {
     <#
     Captures Autopilot + Intune-side diagnostic logs into base64-encoded
@@ -3103,7 +3386,14 @@ Function Invoke-BiitDiagnosticsCapture {
          Log entries from 6 Autopilot/AAD/MDM channels, network reachability,
          time sync, ipconfig. Designed to make 0x801c03f3-class AAD-join
          failures self-diagnosable from a single file.
-      3. Newest IntuneManagementExtension log (Win32 app installs, sidecar).
+      3. ime-and-debug-{serial}.zip — ALL IME logs (was: newest 1, too
+         narrow per PaceAirFreight MZ038GGC 2026-05-20) + per-app install
+         state registry dumps (HKLM\IntuneManagementExtension +
+         HKLM\Enrollments) + Microsoft-Windows-AAD-CloudAP/Operational EVTX
+         + AppXDeploymentServer/Operational EVTX + summary.txt with
+         Get-AppxPackage state for Sidecar-adjacent UWP packages. Answers
+         the load-bearing question "which provider was the ESP waiting
+         on when the 30-min timer expired?"
       4. oobe-temp-logs-{serial}.zip — bundle of every PowerShell/Win32-
          deploy script log in C:\Windows\Temp. Up to 25 files matching
          PS*, EnrollmentScript-*, Install-*, Detection-*, PSAppDeployToolkit*,
@@ -3207,11 +3497,21 @@ Function Invoke-BiitDiagnosticsCapture {
         $candidates += (Get-Item $contextPath)
     }
 
-    # 3) IME logs — newest 1 (not 2; oobe-context.txt now consumes a slot).
-    $imeDir = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs"
-    if (Test-Path $imeDir) {
-        $candidates += Get-ChildItem -Path $imeDir -Filter '*.log' -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    # 3) ime-and-debug-{serial}.zip -- ALL IME logs + per-app install
+    # state registry + AAD-CloudAP / AppXDeploymentServer / DM-Debug EVTX
+    # + Get-AppxPackage summary for Sidecar-adjacent UWP. Replaces the
+    # prior "newest 1 IME log" approach which was too narrow to identify
+    # which specific Win32 app provider was hanging the ESP DevicePreparation
+    # policy-provider-installation wait. PaceAirFreight MZ038GGC
+    # 2026-05-20: the 30-min Sidecar timeout corresponded to
+    # "waitForPolicyProviderInstallationToComplete" timing out; naming
+    # the stuck provider needs the full IME log set + the
+    # IntuneManagementExtension registry hive that tracks per-app
+    # install attempts.
+    Write-Host "  Bundling IME logs + Win32-app install registry + AAD-CloudAP/AppXDeployment EVTX..." -ForegroundColor Gray
+    $imeAndDebugZipPath = Build-BiitImeAndDebugZip -Serial $serial
+    if ($imeAndDebugZipPath -and (Test-Path $imeAndDebugZipPath)) {
+        $candidates += (Get-Item $imeAndDebugZipPath)
     }
 
     # 4) Bundle every PowerShell / Win32-deploy log in C:\Windows\Temp into
