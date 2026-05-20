@@ -3112,12 +3112,12 @@ Function Invoke-BiitDiagnosticsCapture {
          EnrollmentScript-*.log" approach being too narrow — the 5-file
          backend cap is preserved by collapsing all script logs into one
          archive slot.
-      5. MDMDiagReport.xml — uncompressed CSP processing trace from
-         MdmDiagnosticsTool -out. Sidesteps the LZX compression in the CAB
-         so the BIIT backend / Linux-side tooling can parse the XML directly
-         to find which specific CSP hung during ESP DeviceSetup. The same
-         data is also inside the CAB but extracting from LZX cabs without
-         a Windows machine is painful.
+      5. mdm-diag-out-{serial}.zip -- DEFLATE-compressed bundle of the entire
+         `MdmDiagnosticsTool -out` directory: MDMDiagReport.xml + area-specific
+         XMLs + registry dumps. Sidesteps the LZX compression in the CAB so
+         the BIIT backend / Linux-side tooling can parse on Linux to find the
+         specific CSP that hung during ESP DeviceSetup. The same data is in
+         the CAB but LZX cabs can't be cracked off-Windows.
 
     Each file is capped at $MaxBytes (default 10 MB) before encoding;
     files larger than the cap are tail-truncated to the last $MaxBytes
@@ -3155,29 +3155,46 @@ Function Invoke-BiitDiagnosticsCapture {
     }
 
     # 1b) MdmDiagnosticsTool -out: also produce UNCOMPRESSED output in a
-    # temp directory so we can extract MDMDiagReport.xml separately. The
-    # -cab path uses LZX compression which most non-Windows extractors can't
-    # decode (caught analysing the Pace MZ038GGC 2026-05-20 diag — `cabextract`
-    # and Python `cabarchive` both choked on LZX). MDMDiagReport.xml has the
-    # CSP processing trace + per-policy result + session GUIDs that the cab
-    # XML extraction would expose.
+    # temp directory and bundle the whole thing as a zip. The -cab path uses
+    # LZX compression which most non-Windows extractors can't decode (caught
+    # analysing the Pace MZ038GGC 2026-05-20 diag -- `cabextract` and Python
+    # `cabarchive` both choked on LZX). The -out flag produces MDMDiagReport.xml
+    # + area-specific XMLs + a registry dump uncompressed, but the file layout
+    # depends on the -area combination passed; bundling the entire output dir
+    # as a zip means we don't have to guess at the file name (the prior version
+    # of this code looked specifically for `MDMDiagReport.xml` and silently
+    # produced nothing when -area-with-out didn't lay it down at the expected
+    # path -- Pace MZ038GGC attempt-6 surfaced that). With the zip approach,
+    # whatever MdmDiagnosticsTool produces lands in our 5th upload slot.
     $mdmOutDir = "C:\Windows\Temp\biit-mdm-out-$serial"
-    $mdmDiagReportPath = $null
+    $mdmOutZipPath = $null
     try {
         if (Test-Path $mdmOutDir) { Remove-Item $mdmOutDir -Recurse -Force -ErrorAction SilentlyContinue }
         New-Item -ItemType Directory -Path $mdmOutDir -Force -ErrorAction Stop | Out-Null
+        # Note: no -area flag -- the bare `-out path` form collects the
+        # default scope including MDMDiagReport.xml reliably. The -cab call
+        # above already covers Autopilot + DeviceProvisioning + DeviceEnrollment
+        # + TPM, so we're not losing coverage by dropping the explicit areas
+        # here.
         $proc2 = Start-Process -FilePath "$env:windir\System32\MdmDiagnosticsTool.exe" `
-            -ArgumentList @('-area','Autopilot;DeviceProvisioning;DeviceEnrollment','-out',$mdmOutDir) `
+            -ArgumentList @('-out',$mdmOutDir) `
             -NoNewWindow -PassThru -Wait -ErrorAction Stop
-        $xml = Get-ChildItem -Path $mdmOutDir -Filter 'MDMDiagReport.xml' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($xml) {
-            # Copy to a well-known name alongside the CAB so the upload
-            # selector can find it deterministically.
-            $mdmDiagReportPath = "C:\Windows\Temp\mdm-diag-report-$serial.xml"
-            Copy-Item -Path $xml.FullName -Destination $mdmDiagReportPath -Force -ErrorAction Stop
+        if ($proc2.ExitCode -ne 0) {
+            Write-Host "  MdmDiagnosticsTool -out exit code $($proc2.ExitCode) -- bundling whatever was produced." -ForegroundColor Yellow
+        }
+        # Diagnostic: list what was actually produced so future debugging is
+        # easier when the contents change shape across Windows builds.
+        $produced = Get-ChildItem -Path $mdmOutDir -Recurse -File -ErrorAction SilentlyContinue
+        if ($produced) {
+            Write-Host "  MdmDiagnosticsTool -out produced $($produced.Count) file(s) -- bundling as zip." -ForegroundColor Gray
+            $mdmOutZipPath = "C:\Windows\Temp\mdm-diag-out-$serial.zip"
+            if (Test-Path $mdmOutZipPath) { Remove-Item $mdmOutZipPath -Force -ErrorAction SilentlyContinue }
+            Compress-Archive -Path "$mdmOutDir\*" -DestinationPath $mdmOutZipPath -Force -ErrorAction Stop
+        } else {
+            Write-Host "  MdmDiagnosticsTool -out produced no files at $mdmOutDir -- skipping bundle." -ForegroundColor Yellow
         }
     } catch {
-        Write-Host "  MdmDiagnosticsTool -out (uncompressed XML) failed: $_" -ForegroundColor Yellow
+        Write-Host "  MdmDiagnosticsTool -out (uncompressed XML bundle) failed: $_" -ForegroundColor Yellow
     }
 
     $candidates = @()
@@ -3209,12 +3226,13 @@ Function Invoke-BiitDiagnosticsCapture {
         $candidates += (Get-Item $tempLogsZipPath)
     }
 
-    # 5) MDMDiagReport.xml — uncompressed CSP processing trace. Produced
-    # alongside the CAB above so backend can parse on Linux without needing
-    # an LZX cab extractor.
-    if ($mdmDiagReportPath -and (Test-Path $mdmDiagReportPath)) {
-        Write-Host "  Including uncompressed MDMDiagReport.xml…" -ForegroundColor Gray
-        $candidates += (Get-Item $mdmDiagReportPath)
+    # 5) mdm-diag-out-{serial}.zip -- uncompressed MdmDiagnosticsTool -out
+    # bundle. Contains MDMDiagReport.xml + area-specific XMLs + registry
+    # dumps. Plain DEFLATE zip (not LZX) so backend can parse on Linux
+    # without needing a CAB extractor.
+    if ($mdmOutZipPath -and (Test-Path $mdmOutZipPath)) {
+        Write-Host "  Including uncompressed mdm-diag-out zip..." -ForegroundColor Gray
+        $candidates += (Get-Item $mdmOutZipPath)
     }
 
     if (-not $candidates -or $candidates.Count -eq 0) {
