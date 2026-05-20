@@ -2754,13 +2754,14 @@ Function Build-BiitOobeContextFile {
         @{Name='Microsoft-Windows-ModernDeployment-Diagnostics-Provider/ManagementService';Max=200},
         @{Name='Microsoft-Windows-Provisioning-Diagnostics-Provider/Admin';               Max=200},
         @{Name='Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Admin';Max=500},
-        # New channels surfacing Sidecar / Cloud Auth Provider activity. These
-        # are silent during a healthy enrollment but light up when Sidecar
-        # (AAD Cloud AP plugin) install hangs — the exact failure mode where
-        # the prior 50-event window per channel was insufficient to find the
-        # specific stuck operation.
-        @{Name='Microsoft-Windows-CloudAP/Operational';                                   Max=200},
-        @{Name='Microsoft-Windows-AAD/Admin';                                             Max=200},
+        # CAPI2 + Crypto-NCrypt surface cert chain / TPM key generation
+        # activity that backs Sidecar's AAD device cert exchange. Both
+        # disabled by default on Win11 26100 so often report 0 events —
+        # capture-if-available pattern via try/catch below.
+        # (Earlier draft included Microsoft-Windows-CloudAP/Operational +
+        # Microsoft-Windows-AAD/Admin — both rejected by Get-WinEvent on
+        # Win11 26100 because the channels don't exist. Sidecar's AAD
+        # activity surfaces in AAD/Operational which is already captured.)
         @{Name='Microsoft-Windows-CAPI2/Operational';                                     Max=100},
         @{Name='Microsoft-Windows-Crypto-NCrypt/Operational';                             Max=100}
     )
@@ -2842,7 +2843,9 @@ Function Build-BiitOobeContextFile {
     $serviceNames = @('dmwappushservice','wuauserv','w32time','MpsSvc','IKEEXT',
                       'CryptSvc','BFE','EventLog','TrustedInstaller','DcomLaunch',
                       'lfsvc','TokenBroker','wlpasvc','UserManager','WlanSvc',
-                      'wcncsvc','WebClient','wppushservice')
+                      'wcncsvc','WebClient')
+    # (Removed 'wppushservice' from earlier draft — typo for the real name
+    # 'dmwappushservice' which is already in the list above.)
     foreach ($svc in $serviceNames) {
         try {
             $s = Get-Service -Name $svc -ErrorAction Stop
