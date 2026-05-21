@@ -2768,16 +2768,23 @@ Function Build-BiitOobeContextFile {
     foreach ($cfg in $eventLogConfig) {
         $lg = $cfg.Name; $max = $cfg.Max
         Add-Section "Event Log — $lg (most recent $max events)"
-        try {
-            $events = Get-WinEvent -LogName $lg -MaxEvents $max -ErrorAction Stop
+        # SilentlyContinue (not Stop) so an empty channel doesn't emit a noisy
+        # PS>TerminatingError into the transcript log even though try/catch
+        # would swallow it. Both "channel doesn't exist on this SKU/build"
+        # AND "channel exists but has no matching events" return null without
+        # error spam. PaceAirFreight 2026-05-21 fleet-test enrollment log:
+        # Get-WinEvent on Crypto-NCrypt/Operational (disabled by default on
+        # Win11 26100) dumped the terminating error into the transcript even
+        # though it was caught. Cleaned up here.
+        $events = Get-WinEvent -LogName $lg -MaxEvents $max -ErrorAction SilentlyContinue
+        if ($null -ne $events -and $events.Count -gt 0) {
             foreach ($ev in $events) {
                 $msg = if ($ev.Message) { $ev.Message -replace "`r`n", " | " -replace "`n", " | " } else { "<no message>" }
                 if ($msg.Length -gt 500) { $msg = $msg.Substring(0, 500) + "...[truncated]" }
                 Add-Line ("[{0}] L={1} ID={2} Src={3} :: {4}" -f $ev.TimeCreated.ToString('s'), $ev.LevelDisplayName, $ev.Id, $ev.ProviderName, $msg)
             }
-        } catch {
-            # Channel might not exist on this Windows SKU/build; not fatal.
-            Add-Line "Could not read: $($_.Exception.Message)"
+        } else {
+            Add-Line "(no events — channel inaccessible, disabled, or empty)"
         }
     }
 
@@ -3361,6 +3368,11 @@ Function Build-BiitImeAndDebugZip {
     # `wevtutil epl` exports the full binary EVTX file (much richer than
     # `Get-WinEvent | Export-Clixml`). Channels that don't exist on this
     # Windows build return non-zero exit; skip silently.
+    #
+    # Pre-check channel existence with `wevtutil gl` before `epl` to avoid
+    # the "exit 15007" (channel-not-found) noise in the transcript. On
+    # Win11 26100, Microsoft-Windows-AAD-CloudAP/Operational doesn't exist
+    # so the pre-check filters it out before we attempt the export.
     $evtxTargets = @(
         @{ Channel='Microsoft-Windows-AAD-CloudAP/Operational';        File='aad-cloudap.evtx' },
         @{ Channel='Microsoft-Windows-AppXDeploymentServer/Operational'; File='appx-deployment.evtx' },
@@ -3368,6 +3380,16 @@ Function Build-BiitImeAndDebugZip {
     )
     foreach ($t in $evtxTargets) {
         $outPath = Join-Path $stageDir $t.File
+        # Pre-check: `wevtutil gl <channel>` returns exit 0 + config dump on
+        # known channels, exit non-zero on unknown ones. Redirect stderr so
+        # the "channel does not exist" message doesn't appear in the
+        # transcript when we're intentionally probing.
+        $glCheck = & "$env:windir\System32\wevtutil.exe" gl $t.Channel 2>$null
+        $glOk = ($LASTEXITCODE -eq 0)
+        if (-not $glOk) {
+            # Channel doesn't exist on this Windows SKU/build. No-op silently.
+            continue
+        }
         try {
             $proc = Start-Process -FilePath "$env:windir\System32\wevtutil.exe" `
                 -ArgumentList @('epl', $t.Channel, $outPath, '/ow:true') `
