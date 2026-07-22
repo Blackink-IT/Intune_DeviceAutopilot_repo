@@ -2469,6 +2469,27 @@ Function Invoke-BiitPortalUpload() {
         return
     }
 
+    # Autopilot supportability gate — Windows Home cannot complete Autopilot
+    # enrollment (no MDM/CSP provisioning support); it dies mid-OOBE at the
+    # MDMEnrolling phase with 0x80180022. Block the upload here so a Home
+    # device never enters the deployment queue and no tech burns cycles
+    # re-imaging / re-importing a device that can never enroll. EditionID
+    # (registry) is authoritative in OOBE — Core* = the Home family; the OS
+    # Caption ("... Home") is the human-readable fallback.
+    $editionId = $null
+    try { $editionId = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name EditionID -ErrorAction Stop).EditionID } catch {}
+    $osCaption = $null
+    try { $osCaption = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Caption } catch {}
+    if (($editionId -match '^Core') -or ($osCaption -match '\bHome\b')) {
+        $editionLabel = if ([string]::IsNullOrWhiteSpace($editionId)) { $osCaption } else { $editionId }
+        Write-Host ""
+        Write-Host "BLOCKED: this device is running Windows Home ($editionLabel)." -ForegroundColor Red
+        Write-Host "Windows Home is NOT supported by Windows Autopilot and will fail OOBE enrollment (0x80180022)." -ForegroundColor Red
+        Write-Host "Fix: upgrade to Windows Pro / Enterprise / Education (Settings > System > Activation -> change" -ForegroundColor Yellow
+        Write-Host "product key or subscription activation; no reinstall needed), then re-run this enrollment step." -ForegroundColor Yellow
+        return
+    }
+
     # Model + device type from CIM — independent of the AutoPilot CSV.
     $cs = Get-CimInstance -Class Win32_ComputerSystem
     $model = $cs.Model.Trim()
@@ -2714,6 +2735,16 @@ Function Build-BiitOobeContextFile {
     try {
         $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
         Add-Line "OS:         $($os.Caption) build $($os.BuildNumber)"
+        # Autopilot supportability verdict — surfaces the edition as an explicit
+        # PASS/FAIL instead of leaving it buried in the OS caption. Home fails
+        # OOBE enrollment (0x80180022); Autopilot requires Pro/Enterprise/Education.
+        $diagEditionId = $null
+        try { $diagEditionId = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name EditionID -ErrorAction Stop).EditionID } catch {}
+        if (($diagEditionId -match '^Core') -or ($os.Caption -match '\bHome\b')) {
+            Add-Line "AP support: *** UNSUPPORTED — Windows Home edition ($diagEditionId); Autopilot requires Pro/Enterprise/Education (fails OOBE with 0x80180022) ***"
+        } else {
+            Add-Line "AP support: OK (edition $diagEditionId)"
+        }
         Add-Line "Last boot:  $($os.LastBootUpTime)"
     } catch { Add-Line "OS info: $_" }
     try { Add-Line "TZ:         $((Get-TimeZone).DisplayName)" } catch {}
