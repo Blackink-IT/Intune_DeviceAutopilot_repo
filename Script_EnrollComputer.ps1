@@ -2665,13 +2665,36 @@ Function Invoke-BiitPortalUpload() {
             Write-Host "Code must be 6 digits." -ForegroundColor Red
             return
         }
+
+        # PRP-39 item 1+2 — name prompt for the audit trail. OPTIONAL on both
+        # single-use and multi-use codes. It is never a blocker: pressing Enter
+        # uploads without a name. The name, when given, pins a multi-use code
+        # to that person for the rest of the batch.
+        #
+        # Do NOT make this mandatory. The original PRP-39 backend REQUIRED the
+        # field on multi-use codes while this prompt sat in an unmerged PR, so
+        # every multi-use code 401'd "Invalid or expired code" on its FIRST
+        # redemption and the 5-strike counter then killed the code. The backend
+        # gate was retired 2026-08-20; a hard abort here would just move the
+        # same block onto the script side.
+        $redeemedByName = (Read-Host "`nYour full name for the audit trail (press Enter to skip)").Trim()
+        if ($redeemedByName.Length -gt 80) {
+            $redeemedByName = $redeemedByName.Substring(0, 80)
+        }
+
         $body = @{
             code         = $code
             hardwareHash = $hardwareHash
             serialNumber = $serialNumber
             model        = $model
             deviceType   = $deviceType
-        } | ConvertTo-Json -Compress
+        }
+        # Send the field only when it has a value — the backend 400s on a
+        # present-but-blank redeemedByName.
+        if (-not [string]::IsNullOrWhiteSpace($redeemedByName)) {
+            $body.redeemedByName = $redeemedByName
+        }
+        $body = $body | ConvertTo-Json -Compress
 
         try {
             Write-Host "`nUploading to portal (30s timeout)…" -ForegroundColor Gray
@@ -2690,7 +2713,7 @@ Function Invoke-BiitPortalUpload() {
             catch { Write-Host "UCPD pre-configure raised: $_" -ForegroundColor Yellow }
         } catch {
             Write-Host "Upload failed: $_" -ForegroundColor Red
-            Write-Host "(Codes are single-use and invalidate after 5 failed attempts.)" -ForegroundColor Yellow
+            Write-Host "(A code invalidates after 5 failed attempts — ask the tech for a fresh one rather than retrying.)" -ForegroundColor Yellow
         }
     }
 }
